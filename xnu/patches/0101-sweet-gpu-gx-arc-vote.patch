@@ -1,0 +1,62 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 448f9ce..0d1176b 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -276,6 +276,8 @@ struct gpu_gx_rail_probe {
+ 	uint32_t sptprac_before, sptprac_status;
+ 	uint32_t hfi_status_before, hfi_status;
+ 	uint32_t gx_gdscr_before, gx_gdscr_awake, gx_gdscr_final;
++	uint32_t gx_vote, mx_vote;
++	uint32_t gx_vote_readback, mx_vote_readback;
+ 	unsigned int restored;
+ 	const char *error;
+ };
+@@ -1366,26 +1368,30 @@ gpu_gmu_gx_rail(vm_offset_t gmu, vm_offset_t cc, struct gpu_power_experiment *x)
+ 	r->sptprac_before = gpu_read32(gmu, 0x14340);
+ 	r->hfi_status_before = gpu_read32(gmu, 0x14600);
+ 
+-	/* 1. GMU boot slumber option and vote indexes */
++	/* 1. GMU boot slumber option and vote indexes (Turbo=7 for GX, Nominal=3 for MX) */
++	r->gx_vote = 7;
++	r->mx_vote = 3;
+ 	gpu_write32(gmu, 0x8fe0, 0);
+-	gpu_write32(gmu, 0x8fe4, 0);
+-	gpu_write32(gmu, 0x8fe8, 0);
++	gpu_write32(gmu, 0x8fe4, r->gx_vote);
++	gpu_write32(gmu, 0x8fe8, r->mx_vote);
++	r->gx_vote_readback = gpu_read32(gmu, 0x8fe4);
++	r->mx_vote_readback = gpu_read32(gmu, 0x8fe8);
+ 
+ 	/* 2. OOB BOOT_SLUMBER handshake: request bit 22, poll ACK bit 30 */
+ 	r->started = 1;
+ 	printf("SWEET GPU: requesting OOB BOOT_SLUMBER (bit 22); polling ACK (bit 30)\n");
+ 	gpu_write32(gmu, 0x14650, 1u << 22);
+ 
+-	for (unsigned int i = 0; i < 100; i++) {
++	for (unsigned int i = 0; i < 200; i++) {
+ 		val = gpu_read32(gmu, 0x14648);
+ 		r->oob_polls = i + 1;
+ 		if (val & (1u << 30)) {
+ 			r->oob_done = 1;
+-			r->oob_info_after = val;
+ 			break;
+ 		}
+ 		delay(100);
+ 	}
++	r->oob_info_after = val;
+ 	gpu_write32(gmu, 0x14644, 1u << 30);
+ 
+ 	if (!r->oob_done) {
+@@ -1890,8 +1896,10 @@ gpu_power_log(const struct gpu_power_experiment *x)
+ 	}
+ 	if (x->gx.requested) {
+ 		const struct gpu_gx_rail_probe *r = &x->gx;
+-		printf("SWEET GPU: GX rail started=%u oob=%u polls=%u sptprac=%u polls=%u (0x%08x) hfi=%u polls=%u (0x%08x) GX=0x%08x/0x%08x/0x%08x restored=%u result: %s\n",
+-		    r->started, r->oob_done, r->oob_polls, r->sptprac_done, r->sptprac_polls, r->sptprac_status,
++		printf("SWEET GPU: GX rail started=%u votes gx=%u mx=%u (rd 0x%x/0x%x) oob=%u polls=%u (before=0x%08x after=0x%08x) sptprac=%u polls=%u (0x%08x) hfi=%u polls=%u (0x%08x) GX=0x%08x/0x%08x/0x%08x restored=%u result: %s\n",
++		    r->started, r->gx_vote, r->mx_vote, r->gx_vote_readback, r->mx_vote_readback,
++		    r->oob_done, r->oob_polls, r->oob_info_before, r->oob_info_after,
++		    r->sptprac_done, r->sptprac_polls, r->sptprac_status,
+ 		    r->hfi_done, r->hfi_polls, r->hfi_status,
+ 		    r->gx_gdscr_before, r->gx_gdscr_awake, r->gx_gdscr_final,
+ 		    r->restored,

@@ -1491,13 +1491,14 @@ int main(void)
         assert(!r->error && r->started && r->oob_done && r->sptprac_done && r->hfi_done && r->restored);
         assert(r->oob_polls == 1 && r->sptprac_polls == 1 && r->hfi_polls == 1);
         assert(r->sptprac_status == 0x28 && (r->hfi_status & 1));
+        assert(r->gx_vote == 7 && r->mx_vote == 3 && r->gx_vote_readback == 7 && r->mx_vote_readback == 3);
         assert(r->gx_gdscr_final == r->gx_gdscr_before && gmu_mem[0x14000/4] == 1);
 
         /* OOB timeout */
         gx_defaults(); x = &gpu_boot_inventory.power;
         gx_fail_oob = 1;
         gpu_gmu_first_start((vm_offset_t)gmu_mem, (vm_offset_t)smmu_mem, (vm_offset_t)cc, x, mode); r = &x->gx;
-        assert(r->started && !r->oob_done && r->oob_polls == 100 && r->error && r->restored);
+        assert(r->started && !r->oob_done && r->oob_polls == 200 && r->error && r->restored);
 
         /* SPTPRAC timeout */
         gx_defaults(); x = &gpu_boot_inventory.power;
