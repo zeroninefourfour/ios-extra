@@ -37,11 +37,15 @@ def main():
     parser.add_argument('--name', required=True, help='short image label')
     parser.add_argument('--ci-run', type=int, required=True)
     parser.add_argument('--commit', required=True, help='source commit the CI run built')
+    parser.add_argument('--battery', action='store_true', help='enable sweetbattery=1')
     parser.add_argument('--adt', type=Path, default=ROOT / 'shim/out/sweet-0082hi.adt')
     args = parser.parse_args()
 
     out = ROOT / 'shim/out'
-    cmdline = BOOT_ARGS + f' sweetgpu={args.mode}'
+    cmdline = BOOT_ARGS
+    if args.battery:
+        cmdline += ' sweetbattery=1'
+    cmdline += f' sweetgpu={args.mode}'
     assert len(cmdline.encode()) < mkpayload.BOOT_LINE_LENGTH, 'boot line too long'
     payload = out / f'payload-{args.patch}-{args.name}.bin'
     blob, info = mkpayload.build(str(args.kernel), str(args.adt), cmdline)
