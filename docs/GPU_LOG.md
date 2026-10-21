@@ -5,6 +5,25 @@ CI runs, phone results and the reasoning at the time. The current state and the 
 action are in [NOTES.md](../NOTES.md) and [HANDOFF.md](../HANDOFF.md). Entries that say
 "not yet built/booted" were true when written; newer entries supersede them.
 
+## Phone result — 0099 GMU First Start, 2026-10-21 19:42 UTC
+
+- Booted `shim/out/shim-boot-0099-firststart.img` (SHA256 `9f9bc5128459cce5d2ba2cea067479d75dc8aae954093378568f574bedd212eb`), `sweetgpu=16 sweetbattery=1`.
+- Built by CI run `39592212501` (success in 7m24s) from commit `f967697b090623f9907f15cb68e64c20f18aa4bc` on fork `zeroninefourfour/ios-extra`.
+- Telemetry: 262 KB decoded over UDP port 5140.
+- **Measured Hardware Result**:
+  `SWEET GPU: first-start started=1 done=1 polls=2 init=0xbabeface busy=0x00000000 reset=0x1 sCR0=0x00200626/0x00200602 GX=0x00222001/0x00222001 restored=1 quarantined=0 result: GMU initialization signature observed; CM3 safely reset`
+  - In only 2 polls (200 us), the GMU Cortex-M3 processor ran firmware initialization and signaled `FW_INIT_RESULT = 0xbabeface`!
+  - SMMU fault containment (`sCR0` bits GFIE/GCFGFIE) safely shielded the CPU.
+  - Safe rollback immediately asserted `CM3_SYSRESET = 1`, restored SMMU `sCR0` and GMU registers. GX remained safe (0x00222001).
+  - User confirmed dynamic battery reporting from PM6150 PMIC is working, lock screen unlocked, and home screen responsive.
+
+## Phone result — 0098 IRQ mask/restore, 2026-10-21 19:21 UTC
+
+- Booted `shim/out/shim-boot-0098-irqmask.img` (SHA256 `cfba8f14561037b8d04a9851118b55b363965fac4929aa53aeb62dec4cd7a175`), `sweetgpu=15`.
+- Built by CI run `39307039113`.
+- User confirmed lock screen and home screen unlock. Both GMU interrupt sources masked and restored cleanly.
+
+
 ## 0098 CI started at handoff — 2026-10-19
 
 - Implementation/checks/handoff commit `edab65c998a917d5e450b730aa4d0ff2e8e6032e` pushed.
