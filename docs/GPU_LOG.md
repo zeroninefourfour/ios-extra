@@ -5,6 +5,21 @@ CI runs, phone results and the reasoning at the time. The current state and the 
 action are in [NOTES.md](../NOTES.md) and [HANDOFF.md](../HANDOFF.md). Entries that say
 "not yet built/booted" were true when written; newer entries supersede them.
 
+## Phone result — 0100 GX Rail & SPTPRAC, 2026-10-21 21:05 UTC
+
+- Booted `shim/out/shim-boot-0100-gxrail.img` (SHA256 `98dea9577b88b7d774003368da8c24a8cbdf0be9ffd475340c91eab8fad11b94`), `sweetgpu=17 sweetbattery=1`.
+- Built by CI run `39598376855` (success in 7m47s) from commit `86dcc4e` on fork `zeroninefourfour/ios-extra`.
+- Telemetry: Replayed console ring decoded over UDP port 5140.
+- **Measured Hardware Result**:
+  `SWEET GPU: IRQ mask attempted=2 masked=2 restored=1 quarantined=0 masks=0x0000003f/0xffffffff reset/busy/init=0x1/0x0/0x0 GX=0x00222001/0x00222001 result: both sources masked and restored; CM3 stayed reset`
+  `SWEET GPU: GX rail started=1 oob=0 polls=100 sptprac=0 polls=0 (0x00000000) hfi=0 polls=0 (0x00000000) GX=0x00222001/0x00000000/0x00222001 restored=1 result: timed out waiting for OOB BOOT_SLUMBER ACK`
+  `SWEET GPU: first-start started=1 done=1 polls=2 init=0xbabeface busy=0x00000000 reset=0x1 sCR0=0x00200626/0x00200602 GX=0x00222001/0x00222001 restored=1 quarantined=0 result: GMU initialization signature observed; CM3 safely reset`
+- **Key Hardware Findings**:
+  - `REG_A6XX_GMU_RPMH_CTRL` (`+0x143a0`) read `0x00000000` pre-boot; requires `0x00000f11` (`RPMH_INTERFACE_ENABLE | LLC_VOTE | DDR_VOTE | MX_VOTE | CX_VOTE | GFX_VOTE`) to allow the GMU to dispatch hardware resource requests to Qualcomm's RPMh.
+  - `GX_VOTE_IDX` and `MX_VOTE_IDX` were configured to `0` (unpowered level); must point to a non-zero performance corner index from the measured ARC table (e.g. SVS/Nominal).
+  - OOB handshake timeout did not impact OS stability: safe rollback took over cleanly, reset the CM3 core, and verified GX rail collapse (`0x00222001`).
+  - User confirmed dynamic battery reporting from PM6150 PMIC, touch digitizer, and home screen gestures remain completely intact.
+
 ## 0100 GX Rail & SPTPRAC Bring-up — Built & Packaged, 2026-10-21 20:26 UTC
 
 - Full [CI 39598376855](https://github.com/zeroninefourfour/ios-extra/actions/runs/39598376855) **passed** in 7m47s on commit `86dcc4e`.

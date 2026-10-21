@@ -25,7 +25,7 @@ def main():
                     if any(tag in line for tag in ("SWEET", "panic", "SweetBattery", "AppleCLCD", "IOLog")):
                         print(line, flush=True)
             except socket.timeout:
-                if time.monotonic() - start_time > 900:
+                if time.monotonic() - start_time > 86400:
                     break
             except KeyboardInterrupt:
                 break
