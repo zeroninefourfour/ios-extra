@@ -39,7 +39,7 @@ GitHub now confirms public. Kernel builds use this repo's GitHub Actions
 | 0097 | 15 | GMU interrupt mask/restore | 39305068882 **passed** | AO reads 0x3f; guard stops, restored; home screen |
 | 0098 | 15 | exact measured AO readback; continue mask test | 39307039113 **passed** | booted; user confirmed lock screen + unlock |
 | 0099 | 16 | bounded GMU processor release and FW_INIT poll, SMMU sCR0 containment, rollback | 39592212501 **passed** | **0xbabeface** observed in 2 polls; CM3 reset; home screen + battery confirmed |
-| 0100 | 17 | GX power rail, OOB BOOT_SLUMBER handshake, SPTPRAC enable, HFI start, rollback | pending CI | pending |
+| 0100 | 17 | GX power rail, OOB BOOT_SLUMBER handshake, SPTPRAC enable, HFI start, rollback | 39598376855 **passed** | packaged, ready for boot test |
 
 The user confirmed the home screen after every boot up to 0099. Each stage runs
 inside the previous one's window (`sweetgpu=N` includes all lower modes) and undoes

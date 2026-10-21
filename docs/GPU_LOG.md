@@ -5,6 +5,14 @@ CI runs, phone results and the reasoning at the time. The current state and the 
 action are in [NOTES.md](../NOTES.md) and [HANDOFF.md](../HANDOFF.md). Entries that say
 "not yet built/booted" were true when written; newer entries supersede them.
 
+## 0100 GX Rail & SPTPRAC Bring-up — Built & Packaged, 2026-10-21 20:26 UTC
+
+- Full [CI 39598376855](https://github.com/zeroninefourfour/ios-extra/actions/runs/39598376855) **passed** in 7m47s on commit `86dcc4e`.
+- Kernel SHA256 verified against SHA256SUMS. `_gpu_gmu_gx_rail` and `_sweet_gpu_probe` verified via `llvm-nm`.
+- Image packaged: `shim/out/shim-boot-0100-gxrail.img` (SHA256 `98dea9577b88b7d774003368da8c24a8cbdf0be9ffd475340c91eab8fad11b94`, size 20,148,224 bytes, manifest `shim/out/manifest-0100.json`).
+- Command line: `sweetgpu=17 sweetbattery=1 cpus=6 sweetfb_hz=30 sweetusb=2 ...`
+- Verification: Hardware boot pending fastboot connection.
+
 ## Phone result — 0099 GMU First Start, 2026-10-21 19:42 UTC
 
 - Booted `shim/out/shim-boot-0099-firststart.img` (SHA256 `9f9bc5128459cce5d2ba2cea067479d75dc8aae954093378568f574bedd212eb`), `sweetgpu=16 sweetbattery=1`.
