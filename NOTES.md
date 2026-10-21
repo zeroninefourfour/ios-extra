@@ -37,10 +37,10 @@ GitHub now confirms public. Kernel builds use this repo's GitHub Actions
 | 0095 | 13 | bounded TCM retention + RSC wake/stop, CM3 reset | 39300239967 **passed** | wake/stop and full sampled state restore; home screen |
 | 0096 | 14 | read-only GMU IRQ masks/status, fence and RPMH state | 39303111412 **passed** | 6/6 reads; home screen |
 | 0097 | 15 | GMU interrupt mask/restore | 39305068882 **passed** | AO reads 0x3f; guard stops, restored; home screen |
-| 0098 | 15 | exact measured AO readback; continue mask test | 39307039113 **passed** | packaged `shim-boot-0098-irqmask.img`; phone pending |
-| 0099 | 16 | bounded GMU processor release and FW_INIT poll, SMMU sCR0 containment, rollback | pending | unit tested; arm64 compile passed |
+| 0098 | 15 | exact measured AO readback; continue mask test | 39307039113 **passed** | booted; user confirmed lock screen + unlock |
+| 0099 | 16 | bounded GMU processor release and FW_INIT poll, SMMU sCR0 containment, rollback | 39592212501 **passed** | packaged `shim-boot-0099-firststart.img`; phone pending |
 
-The user confirmed the home screen after every boot up to 0097. Each stage runs
+The user confirmed the home screen after every boot up to 0098. Each stage runs
 inside the previous one's window (`sweetgpu=N` includes all lower modes) and undoes
 itself except: SMMU `S2CR3`/`CBAR3` (left inert: `SMR3` invalid, `SCTLR` 0), the
 GMU RCG (left at `0x602`), and the RSC/PDC configuration of 0091 (left in place).
