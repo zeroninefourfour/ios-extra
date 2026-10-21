@@ -37,7 +37,8 @@ GitHub now confirms public. Kernel builds use this repo's GitHub Actions
 | 0095 | 13 | bounded TCM retention + RSC wake/stop, CM3 reset | 39300239967 **passed** | wake/stop and full sampled state restore; home screen |
 | 0096 | 14 | read-only GMU IRQ masks/status, fence and RPMH state | 39303111412 **passed** | 6/6 reads; home screen |
 | 0097 | 15 | GMU interrupt mask/restore | 39305068882 **passed** | AO reads 0x3f; guard stops, restored; home screen |
-| 0098 | 15 | exact measured AO readback; continue mask test | 39307039113 in progress | not tested; no image yet |
+| 0098 | 15 | exact measured AO readback; continue mask test | 39307039113 **passed** | packaged `shim-boot-0098-irqmask.img`; phone pending |
+| 0099 | 16 | bounded GMU processor release and FW_INIT poll, SMMU sCR0 containment, rollback | pending | unit tested; arm64 compile passed |
 
 The user confirmed the home screen after every boot up to 0097. Each stage runs
 inside the previous one's window (`sweetgpu=N` includes all lower modes) and undoes

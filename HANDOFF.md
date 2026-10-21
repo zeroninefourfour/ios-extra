@@ -68,28 +68,11 @@ full CI or phone validation. It omits interrupt protection and must not be appli
 unchanged. Use the measured IRQ/fence values and finish both mask proofs before revising the
 bounded CM3-start patch. Also resolve SMMU global-fault interrupts (see below). No first-start image exists; CM3 has never run.
 
-## Exact continuation for 0098
+## Continuation for 0098 and 0099
 
-The user is stopping for the usage limit. **Do not boot again in this session.**
-On resume, check **CI 39307039113**, source **edab65c998a917d5e450b730aa4d0ff2e8e6032e**:
-`gh run view 39307039113 -R dipa-studio/ios-extra --json status,conclusion,headSha`.
-It was in progress when documented; no green result is claimed. Do not treat
-local tests or a queued run as a green build. Once green, download `xnu-kernel`
-and `xnu-buildtree` to `ios-extra-work/{out-0098,ci-0098}`; verify SHA256SUMS,
-byte-compare GPU/firmware-header/RPMh sources with the isolated tree, and check
-both symbols. Then package using the **CI's head SHA**, not a later docs commit:
-
-```sh
-python3 tools/gpu-package.py --kernel /run/media/dipa/android/ios-extra-work/out-0098/kernel.development.sweet --patch 0098 --mode 15 --name irqmask --ci-run 39307039113 --commit edab65c998a917d5e450b730aa4d0ff2e8e6032e
-```
-
-Only after verification/package, always check `fastboot devices` with serials
-redacted. If one is already there, announce/run the authorized temporary test;
-otherwise ask for fastboot. Use `tools/gpu-phone-test.py` with
-`shim/out/shim-boot-0098-irqmask.img`, the exact SHA from manifest-0098.json and
-log name `phone-0098-irqmask`. Read report 1, record both raw mask writes/restores,
-ask for home screen, then decide from the measured second-mask readback. Do not
-assume that it accepts all ones just because the host model does.
+- **0098 status:** CI 39307039113 passed on edab65c998a917d5e450b730aa4d0ff2e8e6032e. Kernel verified against SHA256SUMS. Temporary boot image packaged at `shim/out/shim-boot-0098-irqmask.img` (SHA256 `cfba8f14561037b8d04a9851118b55b363965fac4929aa53aeb62dec4cd7a175`, manifest `shim/out/manifest-0098.json`, mode 15). Phone boot pending physical device availability.
+- **0099 implementation (`0099-sweet-gpu-first-start.patch`):** Implements `sweetgpu=16`, testing bounded GMU processor release and initial `FW_INIT_RESULT` poll with SMMU `sCR0` fault containment (bits 2 and 5 cleared during run, restored on exit), GMU interrupt masks asserted before release, boot configuration registers programmed, bounded 10 ms poll, immediate `CM3_SYSRESET = 1` assertion, and full rollback.
+- **Verification:** Host MMIO unit test harness (`tests/test_gpu_probe.py`) updated with mode 16 mock hardware and failure models (9 refusal gates, timeout, quarantine, and full replay); all 4 test suites pass. Standalone arm64 object compilation passes with zero errors/warnings.
 
 First-start draft review (not validated or in a phone image):
 

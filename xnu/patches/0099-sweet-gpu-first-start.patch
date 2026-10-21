@@ -1,0 +1,223 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 696a1df..e40ec24 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -48,6 +48,8 @@
+  * RPMH power state after the successful wake/stop; no new writes or CM3 release.
+  * sweetgpu=15 proves both interrupt masks accept all ones and restore, with CM3
+  * still reset; no interrupt clear, firmware release, HFI request or GX write.
++ * sweetgpu=16 tests bounded GMU processor release and initial FW_INIT poll, with
++ * SMMU global fault containment, immediate CM3 reset and full rollback.
+  * Register provenance and limitations: ios-extra/docs/GPU_BRINGUP.md.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -255,8 +257,19 @@ struct gpu_irq_mask_probe {
+ 	const char *error;
+ };
+ 
++struct gpu_first_start {
++	unsigned int requested, started, done, polls;
++	uint32_t init_result, fw_busy, reset_after;
++	uint32_t scr0_before, scr0_after;
++	uint32_t dtcm_word, mask, expected;
++	uint32_t gx_before, gx_final;
++	unsigned int restored, quarantined;
++	const char *error;
++};
++
+ /* Cached outcome of the sweetgpu=3 CX experiment (0 = step not reached). */
+ struct gpu_power_experiment {
++	struct gpu_first_start start;
+ 	struct gpu_irq_mask_probe irq_mask;
+ 	unsigned int irq_preflight_requested, irq_preflight_done;
+ 	const char *irq_preflight_error;
+@@ -1322,6 +1335,155 @@ gpu_gmu_irq_mask_test(vm_offset_t gmu, vm_offset_t cc, struct gpu_power_experime
+ 	if (!m->restored && !m->quarantined) m->error = "IRQ/reset/GX state not fully restored";
+ }
+ 
++static void
++gpu_gmu_first_start(vm_offset_t gmu, vm_offset_t smmu, vm_offset_t cc, struct gpu_power_experiment *x)
++{
++	struct gpu_first_start *s = &x->start;
++	const uint32_t cb = GPU_SMMU_CB0 + GPU_SMMU_GMU_CB * 0x1000u;
++	const uint32_t n = GPU_SMMU_GMU_CB;
++	uint32_t mask, expected, val;
++
++	s->requested = 1;
++	if (x->irq_mask.error || x->irq_mask.attempted != 2 ||
++	    x->irq_mask.masked != 2 || !x->irq_mask.restored || x->irq_mask.quarantined) {
++		s->error = "IRQ mask test incomplete/unrestored; first start skipped";
++		return;
++	}
++	if (!x->buf.requested || x->buf.error || !x->buf.pa ||
++	    x->buf.passed != GPU_BUF_CHECKS || !x->buf.inactive) {
++		s->error = "buffer memory/ATOS checks incomplete; first start skipped";
++		return;
++	}
++	if (x->fw_bad || x->fw_error || x->fw_checked != GPU_GMU_FW_MAX / 4) {
++		s->error = "firmware not loaded/verified; first start skipped";
++		return;
++	}
++	if (gpu_read32(gmu, 0x14000) != 1 || gpu_read32(gmu, 0x14068) != 0 || gpu_read32(gmu, 0x14070) != 0) {
++		s->error = "CM3 not held reset/idle/uninitialized; first start skipped";
++		return;
++	}
++	s->gx_before = gpu_read32(cc, GPU_GX_GDSCR);
++	if (s->gx_before == ~0u || (s->gx_before & GPU_DOMAIN_ON) || !(s->gx_before & GPU_GDSC_SW_COLLAPSE)) {
++		s->error = "GX not off/collapsed; first start skipped";
++		return;
++	}
++
++	/* SMMU sCR0 containment: clear GFIE (bit 2) and GCFGFIE (bit 5) so global faults do not interrupt CPU. */
++	s->scr0_before = gpu_read32(smmu, 0x00);
++	if (s->scr0_before == ~0u) {
++		s->error = "SMMU sCR0 unreadable; first start skipped";
++		return;
++	}
++	gpu_write32(smmu, 0x00, s->scr0_before & ~0x24u);
++	s->scr0_after = gpu_read32(smmu, 0x00);
++	if (s->scr0_after != (s->scr0_before & ~0x24u)) {
++		s->error = "SMMU sCR0 fault containment write failed; first start skipped";
++		goto restore_scr0;
++	}
++
++	clean_dcache64(x->buf.pa, GPU_BUF_BYTES, TRUE);
++
++	/* Re-enable GMU Context Bank 3 buffer mapping */
++	gpu_write32(smmu, GPU_SMMU_CBA2R + 4 * n, 1);
++	gpu_write32(smmu, GPU_SMMU_CBAR + 4 * n, 1u << 16);
++	gpu_write32(smmu, cb + GPU_SMMU_CB_TCR2, 1);
++	gpu_write32(smmu, cb + GPU_SMMU_CB_TCR, 0x802020u);
++	gpu_write64(smmu, cb + GPU_SMMU_CB_TTBR0, x->buf.pa);
++	gpu_write32(smmu, cb + GPU_SMMU_CB_MAIR0, 0x44);
++	gpu_write32(smmu, cb + GPU_SMMU_CB_MAIR1, 0);
++	if (gpu_smmu_tlb_flush(smmu, cb)) {
++		s->error = "SMMU TLB sync timed out; first start skipped";
++		goto restore_smmu;
++	}
++	gpu_write32(smmu, cb + GPU_SMMU_CB_SCTLR, 0x27);
++	gpu_write32(smmu, GPU_SMMU_S2CR + 4 * n, n);
++	gpu_write32(smmu, GPU_SMMU_SMR + 4 * n, (1u << 31) | GPU_SMMU_GMU_SID);
++
++	/* Mask interrupt sources before processor release */
++	gpu_write32(gmu, 0x24c18, ~0u);
++	gpu_write32(gmu, 0x1464c, ~0u);
++
++	/* GMU boot configuration */
++	gpu_write32(gmu, 0x14070, 0);
++	gpu_write32(gmu, 0x14004, 0x02);
++	gpu_write32(gmu, 0x14614, 0x60009000);
++	gpu_write32(gmu, 0x14610, 1);
++	gpu_write32(gmu, 0x24c44, 0x802800a0);
++	gpu_write32(gmu, 0x140b4, 0x4052);
++	gpu_write32(gmu, 0x14608, 0x06018000);
++	gpu_write32(gmu, 0x14400, 0x60005003);
++	gpu_write32(gmu, 0x1303c, 1);
++	gpu_write32(gmu, 0x13000, 1);
++	gpu_write32(gmu, 0x13004, 1);
++	gpu_write32(gmu, 0x14300, 0x09c40400);
++	gpu_write32(gmu, 0x143a0, gpu_read32(gmu, 0x143a0) | 0x00000f11);
++	gpu_write32(gmu, 0x14404, 0);
++
++	s->dtcm_word = gpu_read32(gmu, 0xAFE0);
++	if (s->dtcm_word <= 0x20010004) {
++		mask = 0xffffffff;
++		expected = 0xbabeface;
++	} else {
++		mask = 0x1ff;
++		expected = 0x100;
++	}
++	s->mask = mask;
++	s->expected = expected;
++
++	printf("SWEET GPU: releasing CM3 processor from reset; polling FW_INIT_RESULT\n");
++	s->started = 1;
++	gpu_write32(gmu, 0x14000, 0);
++
++	for (unsigned int i = 0; i < 100; i++) {
++		val = gpu_read32(gmu, 0x14070);
++		s->polls = i + 1;
++		if ((val & mask) == expected) {
++			s->done = 1;
++			break;
++		}
++		delay(100);
++	}
++
++	/* Re-assert CM3 reset immediately */
++	gpu_write32(gmu, 0x14000, 1);
++	s->reset_after = gpu_read32(gmu, 0x14000);
++	s->init_result = gpu_read32(gmu, 0x14070);
++	s->fw_busy = gpu_read32(gmu, 0x14068);
++
++	if (s->reset_after != 1) {
++		s->quarantined = 1;
++		s->error = "CM3 refused reset assertion; quarantined, rollback skipped";
++		return;
++	}
++
++	/* Restore registers */
++	gpu_write32(gmu, 0x14400, 0);
++	gpu_write32(gmu, 0x14614, 0);
++	gpu_write32(gmu, 0x14610, 0);
++	gpu_write32(gmu, 0x14004, 0);
++	gpu_write32(gmu, 0x1303c, 0);
++	gpu_write32(gmu, 0x13000, 0);
++	gpu_write32(gmu, 0x13004, 0);
++	gpu_write32(gmu, 0x14300, 0);
++	gpu_write32(gmu, 0x143a0, 0);
++
++	gpu_write32(gmu, 0x1464c, 0);
++	gpu_write32(gmu, 0x24c18, 0);
++
++restore_smmu:
++	gpu_write32(smmu, GPU_SMMU_SMR + 4 * n, 0);
++	gpu_write32(smmu, cb + GPU_SMMU_CB_SCTLR, 0);
++	(void)gpu_smmu_tlb_flush(smmu, cb);
++	gpu_write64(smmu, cb + GPU_SMMU_CB_TTBR0, 0);
++	gpu_write32(smmu, GPU_SMMU_CBA2R + 4 * n, 0);
++
++restore_scr0:
++	gpu_write32(smmu, 0x00, s->scr0_before);
++	s->restored = 1;
++	s->gx_final = gpu_read32(cc, GPU_GX_GDSCR);
++	if (s->gx_final != s->gx_before) s->restored = 0;
++}
++
+ static void
+ gpu_gmu_read(vm_offset_t cc, struct gpu_power_experiment *x, int mode)
+ {
+@@ -1355,6 +1517,7 @@ gpu_gmu_read(vm_offset_t cc, struct gpu_power_experiment *x, int mode)
+ 				if (mode >= 13) gpu_rsc_wake_run(gmu, cc, x);
+ 				if (mode >= 14) gpu_gmu_irq_preflight(gmu, x);
+ 				if (mode >= 15) gpu_gmu_irq_mask_test(gmu, cc, x);
++				if (mode >= 16) gpu_gmu_first_start(gmu, smmu, cc, x);
+ 			}
+ 		} else if (smmu && mode >= 8) {
+ 			gpu_smmu_gmu_context(smmu, x);
+@@ -1603,6 +1766,14 @@ gpu_power_log(const struct gpu_power_experiment *x)
+ 			printf("SWEET GPU: IRQ mask final %s +0x%x = 0x%08x\n", gpu_irq_preflight_regs[i].name,
+ 			    gpu_irq_preflight_regs[i].off, m->final[i]);
+ 	}
++	if (x->start.requested) {
++		const struct gpu_first_start *s = &x->start;
++		printf("SWEET GPU: first-start started=%u done=%u polls=%u init=0x%08x busy=0x%08x reset=0x%x sCR0=0x%08x/0x%08x GX=0x%08x/0x%08x restored=%u quarantined=%u result: %s\n",
++		    s->started, s->done, s->polls, s->init_result, s->fw_busy, s->reset_after,
++		    s->scr0_before, s->scr0_after, s->gx_before, s->gx_final,
++		    s->restored, s->quarantined,
++		    s->error ? s->error : (s->done ? "GMU initialization signature observed; CM3 safely reset" : "timed out waiting for GMU init signature; CM3 safely reset"));
++	}
+ 	if (x->irq_preflight_requested) {
+ 		for (unsigned int i = 0; i < x->irq_preflight_done; i++)
+ 			printf("SWEET GPU: IRQ preflight %s +0x%x = 0x%08x\n",
+@@ -1911,8 +2082,8 @@ sweet_gpu_probe(void)
+ 	if (!PE_parse_boot_argn("sweetgpu", &mode, sizeof(mode)) || mode == 0) {
+ 		return;
+ 	}
+-	if (mode < 1 || mode > 15) {
+-		printf("SWEET GPU: unsupported sweetgpu=%d (0=off, 1=clocks, 2=+ARC, 3=+CX, 4=+GMU clocks, 5=+GMU reads, 6=+GMU firmware to TCM, 7=+SMMU read, 8=+GMU SMMU context test, 9=+RSC/PDC read, 10=+RSC/PDC init, 11=GMU buffers/ATOS, 12=+pre-boot GMU reads, 13=+RSC wake/stop, 14=+IRQ/fence read-only preflight, 15=+IRQ mask/restore)\n", mode);
++	if (mode < 1 || mode > 16) {
++		printf("SWEET GPU: unsupported sweetgpu=%d (0=off, 1=clocks, 2=+ARC, 3=+CX, 4=+GMU clocks, 5=+GMU reads, 6=+GMU firmware to TCM, 7=+SMMU read, 8=+GMU SMMU context test, 9=+RSC/PDC read, 10=+RSC/PDC init, 11=GMU buffers/ATOS, 12=+pre-boot GMU reads, 13=+RSC wake/stop, 14=+IRQ/fence read-only preflight, 15=+IRQ mask/restore, 16=+first-start CM3 release/poll)\n", mode);
+ 		return;
+ 	}
+ 	if (mode >= 2) {
