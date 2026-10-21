@@ -1,0 +1,201 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index e40ec24..448f9ce 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -50,6 +50,8 @@
+  * still reset; no interrupt clear, firmware release, HFI request or GX write.
+  * sweetgpu=16 tests bounded GMU processor release and initial FW_INIT poll, with
+  * SMMU global fault containment, immediate CM3 reset and full rollback.
++ * sweetgpu=17 brings up the GX power rail, performs the OOB BOOT_SLUMBER handshake,
++ * enables SPTPRAC shader clustering, polls HFI init, and cleans up.
+  * Register provenance and limitations: ios-extra/docs/GPU_BRINGUP.md.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -267,8 +269,20 @@ struct gpu_first_start {
+ 	const char *error;
+ };
+ 
++struct gpu_gx_rail_probe {
++	unsigned int requested, started, oob_done, sptprac_done, hfi_done;
++	unsigned int oob_polls, sptprac_polls, hfi_polls;
++	uint32_t oob_info_before, oob_info_after;
++	uint32_t sptprac_before, sptprac_status;
++	uint32_t hfi_status_before, hfi_status;
++	uint32_t gx_gdscr_before, gx_gdscr_awake, gx_gdscr_final;
++	unsigned int restored;
++	const char *error;
++};
++
+ /* Cached outcome of the sweetgpu=3 CX experiment (0 = step not reached). */
+ struct gpu_power_experiment {
++	struct gpu_gx_rail_probe gx;
+ 	struct gpu_first_start start;
+ 	struct gpu_irq_mask_probe irq_mask;
+ 	unsigned int irq_preflight_requested, irq_preflight_done;
+@@ -1336,7 +1350,110 @@ gpu_gmu_irq_mask_test(vm_offset_t gmu, vm_offset_t cc, struct gpu_power_experime
+ }
+ 
+ static void
+-gpu_gmu_first_start(vm_offset_t gmu, vm_offset_t smmu, vm_offset_t cc, struct gpu_power_experiment *x)
++gpu_gmu_gx_rail(vm_offset_t gmu, vm_offset_t cc, struct gpu_power_experiment *x)
++{
++	struct gpu_gx_rail_probe *r = &x->gx;
++	uint32_t val;
++
++	r->requested = 1;
++	r->gx_gdscr_before = gpu_read32(cc, GPU_GX_GDSCR);
++	if (r->gx_gdscr_before == ~0u || (r->gx_gdscr_before & GPU_DOMAIN_ON) || !(r->gx_gdscr_before & GPU_GDSC_SW_COLLAPSE)) {
++		r->error = "GX not off/collapsed before rail test; skipped";
++		return;
++	}
++
++	r->oob_info_before = gpu_read32(gmu, 0x14648);
++	r->sptprac_before = gpu_read32(gmu, 0x14340);
++	r->hfi_status_before = gpu_read32(gmu, 0x14600);
++
++	/* 1. GMU boot slumber option and vote indexes */
++	gpu_write32(gmu, 0x8fe0, 0);
++	gpu_write32(gmu, 0x8fe4, 0);
++	gpu_write32(gmu, 0x8fe8, 0);
++
++	/* 2. OOB BOOT_SLUMBER handshake: request bit 22, poll ACK bit 30 */
++	r->started = 1;
++	printf("SWEET GPU: requesting OOB BOOT_SLUMBER (bit 22); polling ACK (bit 30)\n");
++	gpu_write32(gmu, 0x14650, 1u << 22);
++
++	for (unsigned int i = 0; i < 100; i++) {
++		val = gpu_read32(gmu, 0x14648);
++		r->oob_polls = i + 1;
++		if (val & (1u << 30)) {
++			r->oob_done = 1;
++			r->oob_info_after = val;
++			break;
++		}
++		delay(100);
++	}
++	gpu_write32(gmu, 0x14644, 1u << 30);
++
++	if (!r->oob_done) {
++		r->error = "timed out waiting for OOB BOOT_SLUMBER ACK";
++		goto cleanup;
++	}
++
++	/* 3. Enable SPTPRAC shader core power */
++	printf("SWEET GPU: enabling SPTPRAC (0x778000); polling SPTPRAC_PWR_CLK_STATUS\n");
++	gpu_write32(gmu, 0x204, 0x778000);
++
++	for (unsigned int i = 0; i < 100; i++) {
++		val = gpu_read32(gmu, 0x14340);
++		r->sptprac_polls = i + 1;
++		if ((val & 0x38) == 0x28) {
++			r->sptprac_done = 1;
++			r->sptprac_status = val;
++			break;
++		}
++		delay(10);
++	}
++
++	if (!r->sptprac_done) {
++		r->error = "timed out waiting for SPTPRAC status 0x28";
++		goto cleanup;
++	}
++
++	/* 4. Start HFI */
++	printf("SWEET GPU: initializing HFI (HFI_CTRL_INIT = 1); polling HFI_CTRL_STATUS\n");
++	gpu_write32(gmu, 0x14618, 1);
++
++	for (unsigned int i = 0; i < 100; i++) {
++		val = gpu_read32(gmu, 0x14600);
++		r->hfi_polls = i + 1;
++		if (val & 1) {
++			r->hfi_done = 1;
++			r->hfi_status = val;
++			break;
++		}
++		delay(100);
++	}
++
++	r->gx_gdscr_awake = gpu_read32(cc, GPU_GX_GDSCR);
++
++	if (!r->hfi_done) {
++		r->error = "timed out waiting for HFI_CTRL_STATUS bit 0";
++		goto cleanup;
++	}
++
++cleanup:
++	/* 5. Clean rollback */
++	gpu_write32(gmu, 0x204, 0);
++	gpu_write32(gmu, 0x14618, 0);
++	gpu_write32(gmu, 0x8fe0, 0);
++	gpu_write32(gmu, 0x8fe4, 0);
++	gpu_write32(gmu, 0x8fe8, 0);
++	gpu_write32(gmu, 0x14644, ~0u);
++
++	r->gx_gdscr_final = gpu_read32(cc, GPU_GX_GDSCR);
++	r->restored = 1;
++	if (r->gx_gdscr_final != r->gx_gdscr_before) {
++		r->restored = 0;
++		if (!r->error) r->error = "GX GDSCR not restored";
++	}
++}
++
++static void
++gpu_gmu_first_start(vm_offset_t gmu, vm_offset_t smmu, vm_offset_t cc, struct gpu_power_experiment *x, int mode)
+ {
+ 	struct gpu_first_start *s = &x->start;
+ 	const uint32_t cb = GPU_SMMU_CB0 + GPU_SMMU_GMU_CB * 0x1000u;
+@@ -1444,6 +1561,10 @@ gpu_gmu_first_start(vm_offset_t gmu, vm_offset_t smmu, vm_offset_t cc, struct gp
+ 		delay(100);
+ 	}
+ 
++	if (s->done && mode >= 17) {
++		gpu_gmu_gx_rail(gmu, cc, x);
++	}
++
+ 	/* Re-assert CM3 reset immediately */
+ 	gpu_write32(gmu, 0x14000, 1);
+ 	s->reset_after = gpu_read32(gmu, 0x14000);
+@@ -1482,6 +1603,7 @@ restore_scr0:
+ 	s->restored = 1;
+ 	s->gx_final = gpu_read32(cc, GPU_GX_GDSCR);
+ 	if (s->gx_final != s->gx_before) s->restored = 0;
++	if (x->gx.requested && !x->gx.restored) s->restored = 0;
+ }
+ 
+ static void
+@@ -1517,7 +1639,7 @@ gpu_gmu_read(vm_offset_t cc, struct gpu_power_experiment *x, int mode)
+ 				if (mode >= 13) gpu_rsc_wake_run(gmu, cc, x);
+ 				if (mode >= 14) gpu_gmu_irq_preflight(gmu, x);
+ 				if (mode >= 15) gpu_gmu_irq_mask_test(gmu, cc, x);
+-				if (mode >= 16) gpu_gmu_first_start(gmu, smmu, cc, x);
++				if (mode >= 16) gpu_gmu_first_start(gmu, smmu, cc, x, mode);
+ 			}
+ 		} else if (smmu && mode >= 8) {
+ 			gpu_smmu_gmu_context(smmu, x);
+@@ -1766,6 +1888,15 @@ gpu_power_log(const struct gpu_power_experiment *x)
+ 			printf("SWEET GPU: IRQ mask final %s +0x%x = 0x%08x\n", gpu_irq_preflight_regs[i].name,
+ 			    gpu_irq_preflight_regs[i].off, m->final[i]);
+ 	}
++	if (x->gx.requested) {
++		const struct gpu_gx_rail_probe *r = &x->gx;
++		printf("SWEET GPU: GX rail started=%u oob=%u polls=%u sptprac=%u polls=%u (0x%08x) hfi=%u polls=%u (0x%08x) GX=0x%08x/0x%08x/0x%08x restored=%u result: %s\n",
++		    r->started, r->oob_done, r->oob_polls, r->sptprac_done, r->sptprac_polls, r->sptprac_status,
++		    r->hfi_done, r->hfi_polls, r->hfi_status,
++		    r->gx_gdscr_before, r->gx_gdscr_awake, r->gx_gdscr_final,
++		    r->restored,
++		    r->error ? r->error : "OOB BOOT_SLUMBER ACKed, SPTPRAC enabled, HFI started; clean rollback");
++	}
+ 	if (x->start.requested) {
+ 		const struct gpu_first_start *s = &x->start;
+ 		printf("SWEET GPU: first-start started=%u done=%u polls=%u init=0x%08x busy=0x%08x reset=0x%x sCR0=0x%08x/0x%08x GX=0x%08x/0x%08x restored=%u quarantined=%u result: %s\n",
+@@ -2082,8 +2213,8 @@ sweet_gpu_probe(void)
+ 	if (!PE_parse_boot_argn("sweetgpu", &mode, sizeof(mode)) || mode == 0) {
+ 		return;
+ 	}
+-	if (mode < 1 || mode > 16) {
+-		printf("SWEET GPU: unsupported sweetgpu=%d (0=off, 1=clocks, 2=+ARC, 3=+CX, 4=+GMU clocks, 5=+GMU reads, 6=+GMU firmware to TCM, 7=+SMMU read, 8=+GMU SMMU context test, 9=+RSC/PDC read, 10=+RSC/PDC init, 11=GMU buffers/ATOS, 12=+pre-boot GMU reads, 13=+RSC wake/stop, 14=+IRQ/fence read-only preflight, 15=+IRQ mask/restore, 16=+first-start CM3 release/poll)\n", mode);
++	if (mode < 1 || mode > 17) {
++		printf("SWEET GPU: unsupported sweetgpu=%d (0=off, 1=clocks, 2=+ARC, 3=+CX, 4=+GMU clocks, 5=+GMU reads, 6=+GMU firmware to TCM, 7=+SMMU read, 8=+GMU SMMU context test, 9=+RSC/PDC read, 10=+RSC/PDC init, 11=GMU buffers/ATOS, 12=+pre-boot GMU reads, 13=+RSC wake/stop, 14=+IRQ/fence read-only preflight, 15=+IRQ mask/restore, 16=+first-start CM3 release/poll, 17=+GX rail & SPTPRAC)\n", mode);
+ 		return;
+ 	}
+ 	if (mode >= 2) {

@@ -78,6 +78,7 @@ class GPUProbeTests(unittest.TestCase):
             self.assertEqual(build.returncode, 0, build.stderr)
             result = subprocess.run([str(work / 'test')], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('PASS: GX power rail and SPTPRAC', result.stdout)
             self.assertIn('PASS: first-start CM3 release', result.stdout)
             self.assertIn('PASS: interrupt mask/restore', result.stdout)
             self.assertIn('PASS: six IRQ/fence reads', result.stdout)
@@ -130,10 +131,26 @@ static int irq_model;
 static unsigned irq_trace_n, irq_fail_write, irq_change;
 static uint32_t irq_trace_off[8], irq_trace_value[8], irq_ao_readback, irq_hfi_readback;
 static int start_model, start_model_timeout, start_fail_reset;
+static int gx_model, gx_fail_oob, gx_fail_sptprac, gx_fail_hfi;
 static int smmu_sticky; /* hardware that refuses to take the ABL default back in S2CR3/CBAR3 */
 static void test_store32(vm_offset_t base, uint32_t off, uint32_t value)
 {
     all_mmio_writes++;
+    if (base == (vm_offset_t)gmu_mem) {
+        if (gx_model) {
+            if (off == 0x14650) {
+                if (!gx_fail_oob && (value & (1u << 22))) gmu_mem[0x14648 / 4] |= (1u << 30);
+            } else if (off == 0x14644) {
+                gmu_mem[0x14648 / 4] &= ~value;
+            } else if (off == 0x204) {
+                if (!gx_fail_sptprac && value == 0x778000) gmu_mem[0x14340 / 4] = 0x28;
+                else if (value == 0) gmu_mem[0x14340 / 4] = 0;
+            } else if (off == 0x14618) {
+                if (!gx_fail_hfi && value == 1) gmu_mem[0x14600 / 4] |= 1;
+                else if (value == 0) gmu_mem[0x14600 / 4] &= ~1;
+            }
+        }
+    }
     if (start_model && base == (vm_offset_t)gmu_mem && off == 0x14000) {
         if (value == 0) {
             if (!start_model_timeout) {
@@ -490,6 +507,7 @@ static void start_defaults(void)
 {
     irq_defaults(); mode = 16;
     start_model = 1; start_model_timeout = 0; start_fail_reset = 0;
+    gx_model = 0; gx_fail_oob = 0; gx_fail_sptprac = 0; gx_fail_hfi = 0;
     struct gpu_power_experiment *x = &gpu_boot_inventory.power;
     x->irq_mask.attempted = 2; x->irq_mask.masked = 2; x->irq_mask.restored = 1;
     x->buf.pa = fake_pa_base;
@@ -502,12 +520,20 @@ static void start_defaults(void)
     gmu_mem[0xAFE0/4] = 0; smmu_mem[0x00] = 0x00200626;
 }
 
+static void gx_defaults(void)
+{
+    start_defaults(); mode = 17;
+    gx_model = 1; gx_fail_oob = 0; gx_fail_sptprac = 0; gx_fail_hfi = 0;
+    cc[GPU_GX_GDSCR / 4] = GPU_CX_IDLE_GDSCR;
+    memset(&gpu_boot_inventory.power.gx, 0, sizeof(gpu_boot_inventory.power.gx));
+}
+
 int main(void)
 {
     reset(); present = 0; sweet_gpu_probe();
     assert(map_calls == 0 && output[0] == 0);
     reset(); mode = 0; sweet_gpu_probe(); assert(map_calls == 0);
-    reset(); mode = 17; sweet_gpu_probe(); assert(map_calls == 0);
+    reset(); mode = 18; sweet_gpu_probe(); assert(map_calls == 0);
     reset(); mode = -1; sweet_gpu_probe(); assert(map_calls == 0);
     reset(); fail_gcc = 1; sweet_gpu_probe();
     assert(map_calls == 1 && strstr(output, "GCC mapping failed"));
@@ -1411,7 +1437,7 @@ int main(void)
             if (bad == 8) gmu_mem[0x14068/4] = 1;
             if (bad == 9) gmu_mem[0x14070/4] = 1;
             memcpy(before, gmu_mem, sizeof(before)); memcpy(sb, smmu_mem, sizeof(sb));
-            gpu_gmu_first_start((vm_offset_t)gmu_mem, (vm_offset_t)smmu_mem, (vm_offset_t)cc, x); s = &x->start;
+            gpu_gmu_first_start((vm_offset_t)gmu_mem, (vm_offset_t)smmu_mem, (vm_offset_t)cc, x, mode); s = &x->start;
             assert(s->requested);
             if (bad) {
                 assert(s->error && !s->started && !memcmp(before, gmu_mem, sizeof(before)) && !memcmp(sb, smmu_mem, sizeof(sb)));
@@ -1426,14 +1452,14 @@ int main(void)
         /* Test timeout (firmware never signals ready) */
         start_defaults(); x = &gpu_boot_inventory.power;
         start_model_timeout = 1;
-        gpu_gmu_first_start((vm_offset_t)gmu_mem, (vm_offset_t)smmu_mem, (vm_offset_t)cc, x); s = &x->start;
+        gpu_gmu_first_start((vm_offset_t)gmu_mem, (vm_offset_t)smmu_mem, (vm_offset_t)cc, x, mode); s = &x->start;
         assert(s->started && !s->done && s->polls == 100);
         assert(s->restored && !s->quarantined && gmu_mem[0x14000/4] == 1);
 
         /* Test quarantine (reset refusal) */
         start_defaults(); x = &gpu_boot_inventory.power;
         start_fail_reset = 1;
-        gpu_gmu_first_start((vm_offset_t)gmu_mem, (vm_offset_t)smmu_mem, (vm_offset_t)cc, x); s = &x->start;
+        gpu_gmu_first_start((vm_offset_t)gmu_mem, (vm_offset_t)smmu_mem, (vm_offset_t)cc, x, mode); s = &x->start;
         assert(s->started && s->quarantined && !s->restored && s->error);
 
         /* Full chain mode 16 */
@@ -1444,6 +1470,53 @@ int main(void)
         start_defaults(); mode = 15; gmu_mem[0x24c20/4] = gmu_mem[0x23404/4] = gmu_mem[0x23010/4] = 0;
         arc_run(); assert(!gpu_boot_inventory.power.start.requested);
         puts("PASS: first-start CM3 release, SMMU containment, bounded poll, reset preservation and rollback");
+    }
+
+    /* 0100: GX power rail, OOB BOOT_SLUMBER handshake, SPTPRAC enable, HFI start and safe rollback */
+    {
+        struct gpu_power_experiment *x;
+        struct gpu_gx_rail_probe *r;
+        uint32_t before[GPU_GMU_SIZE/4];
+
+        /* Refusal when GX is not collapsed */
+        gx_defaults(); x = &gpu_boot_inventory.power;
+        cc[GPU_GX_GDSCR/4] |= GPU_DOMAIN_ON;
+        memcpy(before, gmu_mem, sizeof(before));
+        gpu_gmu_gx_rail((vm_offset_t)gmu_mem, (vm_offset_t)cc, x); r = &x->gx;
+        assert(r->requested && r->error && !r->started);
+
+        /* Success case */
+        gx_defaults(); x = &gpu_boot_inventory.power;
+        gpu_gmu_first_start((vm_offset_t)gmu_mem, (vm_offset_t)smmu_mem, (vm_offset_t)cc, x, mode); r = &x->gx;
+        assert(!r->error && r->started && r->oob_done && r->sptprac_done && r->hfi_done && r->restored);
+        assert(r->oob_polls == 1 && r->sptprac_polls == 1 && r->hfi_polls == 1);
+        assert(r->sptprac_status == 0x28 && (r->hfi_status & 1));
+        assert(r->gx_gdscr_final == r->gx_gdscr_before && gmu_mem[0x14000/4] == 1);
+
+        /* OOB timeout */
+        gx_defaults(); x = &gpu_boot_inventory.power;
+        gx_fail_oob = 1;
+        gpu_gmu_first_start((vm_offset_t)gmu_mem, (vm_offset_t)smmu_mem, (vm_offset_t)cc, x, mode); r = &x->gx;
+        assert(r->started && !r->oob_done && r->oob_polls == 100 && r->error && r->restored);
+
+        /* SPTPRAC timeout */
+        gx_defaults(); x = &gpu_boot_inventory.power;
+        gx_fail_sptprac = 1;
+        gpu_gmu_first_start((vm_offset_t)gmu_mem, (vm_offset_t)smmu_mem, (vm_offset_t)cc, x, mode); r = &x->gx;
+        assert(r->started && r->oob_done && !r->sptprac_done && r->sptprac_polls == 100 && r->error && r->restored);
+
+        /* HFI timeout */
+        gx_defaults(); x = &gpu_boot_inventory.power;
+        gx_fail_hfi = 1;
+        gpu_gmu_first_start((vm_offset_t)gmu_mem, (vm_offset_t)smmu_mem, (vm_offset_t)cc, x, mode); r = &x->gx;
+        assert(r->started && r->oob_done && r->sptprac_done && !r->hfi_done && r->hfi_polls == 100 && r->error && r->restored);
+
+        /* Full chain mode 17 */
+        gx_defaults(); gmu_mem[0x24c20/4] = gmu_mem[0x23404/4] = gmu_mem[0x23010/4] = 0;
+        arc_run(); x = &gpu_boot_inventory.power; r = &x->gx;
+        assert(!r->error && r->oob_done && r->sptprac_done && r->hfi_done && r->restored);
+        int writes = all_mmio_writes; sweet_gpu_replay(); assert(writes == all_mmio_writes);
+        puts("PASS: GX power rail and SPTPRAC, OOB handshake, HFI start and safe rollback");
     }
 
     /* Mode 3 never runs the clock stage. */
