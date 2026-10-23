@@ -1,0 +1,522 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 7052e81..cd2f6e8 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_wlan.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 0efc068..2bc0ecf 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_gpu_probe(void);
++extern void sweet_wlan_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -662,6 +663,7 @@ sweet_ufs_init(void)
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
+ 	sweet_gpu_probe();
++	sweet_wlan_probe();
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b725ea7..c9bb1c5 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -774,6 +774,7 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+ extern uint64_t sweet_log_position(void);
+ extern void sweet_gpu_replay(void);
++extern void sweet_wlan_replay(void);
+ 
+ static void
+ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -783,6 +784,7 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	struct sockaddr_in to;
+ 	uint64_t pos = sweet_log_position();
+ 	uint32_t gpu_report_ticks = 0;
++	uint32_t wlan_report_ticks = 0;
+ 
+ 	pos = pos > 65536 ? pos - 65536 : 0;
+ 	bzero(&to, sizeof(to));
+@@ -803,6 +805,12 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 				sweet_gpu_replay();
+ 			}
+ 		}
++		if (wlan_report_ticks < 300) {
++			wlan_report_ticks++;
++			if (wlan_report_ticks == 50 || wlan_report_ticks == 150 || wlan_report_ticks == 300) {
++				sweet_wlan_replay();
++			}
++		}
+ 		if (so == NULL && sock_socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, NULL, &so) != 0) {
+ 			so = NULL;
+ 			continue;
+diff --git a/bsd/dev/sweet_wlan.c b/bsd/dev/sweet_wlan.c
+new file mode 100644
+index 0000000..29e9b5c
+--- /dev/null
++++ b/bsd/dev/sweet_wlan.c
+@@ -0,0 +1,451 @@
++/*
++ * SWEET Wi-Fi bring-up, stage W0: read-only probe of the WCN3990-class
++ * integrated WLAN subsystem (qcom,icnss@18800000) and its prerequisites.
++ *
++ * sweetwlan=1 maps and reads, without writing anything:
++ *   - SMEM at 0x86000000 (2 MiB, no-map reserved region): global header
++ *     (initialized/version/available), partition table ($TOC), and the modem
++ *     SMP2P items (qcom,smp2p-modem qcom,smem = <0x1b3 0x1ac> = 435 in /
++ *     428 out). Their entry names/values show whether the modem published
++ *     channels ("wlan", "master-kernel", ...) after ABL.
++ *   - MSS QDSP6SS at 0x4080000 (qdsp6_base, qcom,mss@4080000): RESET, GFMUX,
++ *     PWR_CTL, BHS_STATUS. ABL state of the modem core, read-only.
++ *   - icnss membase at 0x18800000 (0x800000 window): a few words to prove the
++ *     window is mapped and alive (no SMMU translation is assumed yet).
++ *
++ * Results are printed once from a cached snapshot and replayed by the USB log
++ * thread (sweet_wlan_replay), following the sweetgpu pattern. No firmware,
++ * rails or resets are touched: the modem question is answered before any of
++ * that exists. See the Wi-Fi milestone plan (W0) for the interpretation.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_wlan_probe(void);
++void sweet_wlan_replay(void);
++
++#define WLAN_SMEM_PA            0x86000000ull
++#define WLAN_SMEM_SIZE          0x00200000u
++#define WLAN_MSS_PA             0x04080000
++#define WLAN_MSS_SIZE           0x00000100
++#define WLAN_ICNSS_PA           0x18800000
++#define WLAN_ICNSS_SIZE         0x00800000
++
++/* Linux smem.c layout (little-endian throughout). */
++#define SMEM_ITEM_COUNT         512u
++#define SMEM_HDR_VERS           16u      /* proc_comm[4]*4 + version[32] */
++struct wlan_smem_hdr {
++	uint32_t proc_comm[16];          /* 4 x {cmd,status,params[2]} */
++	uint32_t version[32];
++	uint32_t initialized;
++	uint32_t free_offset;
++	uint32_t available;
++	uint32_t reserved;
++	struct { uint32_t allocated, offset, size, aux_base; } toc[SMEM_ITEM_COUNT];
++};
++
++struct wlan_ptable_entry {
++	uint32_t offset, size, flags;
++	uint16_t host0, host1;
++	uint32_t cacheline;
++	uint32_t reserved[7];
++};
++#define WLAN_PTABLE_OFF         0x400u   /* smem.c: after the header, search */
++struct wlan_ptable {
++	uint8_t magic[4];                /* "$TOC" */
++	uint32_t version;
++	uint32_t num_entries;
++	uint32_t reserved[5];
++	struct wlan_ptable_entry entry[];
++};
++
++struct wlan_part_hdr {                   /* "$PRT" */
++	uint8_t magic[4];
++	uint16_t host0, host1;
++	uint32_t size;
++	uint32_t free_uncached, free_cached;
++	uint32_t reserved[3];
++};
++
++struct wlan_priv_entry {
++	uint16_t canary;                 /* 0xa5a5 */
++	uint16_t item;
++	uint32_t size;                   /* includes padding */
++	uint16_t padding_data, padding_hdr;
++	uint32_t reserved;
++};
++
++#define WLAN_SMP2P_MAGIC        0x504d5324u  /* "$SMP" */
++#define WLAN_SMP2P_MAX_ENTRY    16u
++#define WLAN_SMP2P_NAME_LEN     16u
++#define WLAN_MODEM_SMP2P_IN     435u     /* qcom,smp2p-modem qcom,smem [0] */
++#define WLAN_MODEM_SMP2P_OUT    428u     /* qcom,smp2p-modem qcom,smem [1] */
++#define WLAN_MAX_DUMP_ENTRIES   16u
++
++/* MSS QDSP6SS offsets (pil-q6v5.c; qcom,mss@4080000 qdsp6_base). */
++static const struct { const char *name; uint32_t off; } wlan_mss_regs[] = {
++	{ "RESET",      0x014 },
++	{ "GFMUX_CTL",  0x020 },
++	{ "PWR_CTL",    0x030 },
++	{ "BHS_STATUS", 0x078 },
++	{ "STRAP_ACC",  0x110 },
++};
++#define WLAN_MSS_READS (sizeof(wlan_mss_regs) / sizeof(wlan_mss_regs[0]))
++
++/* icnss membase: copy-engine scratch area per mainline wcn3990; words
++ * chosen to be readable regardless of firmware state, all read-only. */
++static const struct { const char *name; uint32_t off; } wlan_icnss_regs[] = {
++	{ "MEM_0000",   0x0000 },
++	{ "MEM_0010",   0x0010 },
++	{ "MEM_0100",   0x0100 },
++	{ "MEM_1000",   0x1000 },
++	{ "MEM_2000",   0x2000 },
++	{ "MEM_4000",   0x4000 },
++	{ "MEM_10000",  0x10000 },
++	{ "MEM_3F0000", 0x3f0000 },
++};
++#define WLAN_ICNSS_READS (sizeof(wlan_icnss_regs) / sizeof(wlan_icnss_regs[0]))
++
++#define WLAN_FAIL               0xffffffffu  /* read failed marker (bus fault
++                                              * avoidance relies on mappings
++                                              * being device memory) */
++
++struct wlan_smp2p_dump {
++	unsigned int found;
++	uint32_t magic, version, valid_entries, flags;
++	uint16_t local_pid, remote_pid;
++	unsigned int nentries;
++	struct {
++		char name[WLAN_SMP2P_NAME_LEN + 1];
++		uint32_t value;
++	} entry[WLAN_MAX_DUMP_ENTRIES];
++	const char *error;
++};
++
++struct wlan_probe_state {
++	unsigned int requested, smem_mapped, ptable_found, modem_done;
++	uint32_t smem_initialized, smem_free_offset, smem_available;
++	uint32_t smem_version[8];
++	unsigned int nparts;
++	struct { uint16_t host0, host1; uint32_t offset, size; } part[8];
++	struct wlan_smp2p_dump smp2p_in, smp2p_out;
++	unsigned int mss_done;
++	uint32_t mss[WLAN_MSS_READS];
++	unsigned int icnss_done;
++	uint32_t icnss[WLAN_ICNSS_READS];
++	const char *error;
++};
++
++static struct wlan_probe_state wlan_boot_state;
++static volatile unsigned int wlan_state_ready;
++static unsigned int wlan_replay_count;
++
++static inline uint32_t
++wlan_read32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static uint32_t
++wlan_le32(const void *p)
++{
++	const uint8_t *b = p;
++	return (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
++	    ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
++}
++
++/* Little-endian 16-bit read of a possibly unaligned field. */
++static uint16_t
++wlan_le16(const void *p)
++{
++	const uint8_t *b = p;
++	return (uint16_t)(b[0] | (b[1] << 8));
++}
++
++/* Copy an smp2p entry name, bounded; entry names are NUL-padded 16 bytes. */
++static void
++wlan_name_copy(char *dst, const uint8_t *src)
++{
++	unsigned int i;
++	for (i = 0; i < WLAN_SMP2P_NAME_LEN; ++i) {
++		dst[i] = (char)src[i];
++		if (!src[i]) {
++			break;
++		}
++	}
++	dst[i < WLAN_SMP2P_NAME_LEN ? i : WLAN_SMP2P_NAME_LEN] = '\0';
++}
++
++/*
++ * smp2p item body (smp2p.c struct smp2p_smem_item, little-endian fields):
++ * magic u32, version u8 + features 24 bits, local/remote pid u16 x2,
++ * total/valid entries u16 x2, flags u32, then 16 entries of {name[16], value}.
++ */
++#define WLAN_SMP2P_HDR_BYTES    28u
++#define WLAN_SMP2P_ENTRY_BYTES  20u
++
++static void
++wlan_dump_smp2p(struct wlan_smp2p_dump *d, const uint8_t *body, uint32_t size)
++{
++	unsigned int i, valid;
++	d->magic = wlan_le32(body);
++	if (d->magic != WLAN_SMP2P_MAGIC) {
++		d->error = "smp2p magic mismatch";
++		return;
++	}
++	d->version = body[4];
++	d->local_pid = (uint16_t)(body[8] | (body[9] << 8));
++	d->remote_pid = (uint16_t)(body[10] | (body[11] << 8));
++	valid = (uint16_t)(body[12] | (body[13] << 8));
++	d->valid_entries = valid;
++	d->flags = wlan_le32(body + 16);
++	if (valid > WLAN_SMP2P_MAX_ENTRY) {
++		valid = WLAN_SMP2P_MAX_ENTRY;
++	}
++	if (WLAN_SMP2P_HDR_BYTES + (uint32_t)valid * WLAN_SMP2P_ENTRY_BYTES > size) {
++		d->error = "smp2p entries exceed item size";
++		return;
++	}
++	d->found = 1;
++	d->nentries = valid;
++	for (i = 0; i < valid && i < WLAN_MAX_DUMP_ENTRIES; ++i) {
++		const uint8_t *e = body + WLAN_SMP2P_HDR_BYTES + i * WLAN_SMP2P_ENTRY_BYTES;
++		wlan_name_copy(d->entry[i].name, e);
++		d->entry[i].value = wlan_le32(e + WLAN_SMP2P_NAME_LEN);
++	}
++}
++
++/*
++ * Find an SMEM item in the global heap (toc) or in a private partition.
++ * Mirrors qcom_smem_get_global / qcom_smem_get_partition logic, read-only.
++ */
++static const uint8_t *
++wlan_find_item(vm_offset_t smem, const struct wlan_probe_state *st,
++    unsigned int item, uint32_t *out_size)
++{
++	const struct wlan_smem_hdr *h = (const void *)smem;
++	unsigned int p;
++	const struct wlan_ptable *pt;
++
++	/* Global toc first: toc item allocated means it lives in the heap. */
++	if (item < SMEM_ITEM_COUNT && h->toc[item].allocated) {
++		uint32_t aux = h->toc[item].aux_base & 0xfffffffcu;
++		if (aux == 0 || aux == WLAN_SMEM_PA) {   /* default region */
++			*out_size = h->toc[item].size;
++			return (const uint8_t *)smem + h->toc[item].offset;
++		}
++	}
++	/* Private partitions: scan the partition table found earlier. */
++	if (!st->ptable_found) {
++		return NULL;
++	}
++	pt = (const void *)(smem + WLAN_PTABLE_OFF);
++	for (p = 0; p < st->nparts && p < 8; ++p) {
++		uint32_t off = st->part[p].offset;
++		const struct wlan_part_hdr *ph = (const void *)(smem + off);
++		uint32_t uncached = wlan_le32(&ph->free_uncached);
++		uint32_t scan_end = uncached;
++		uint32_t cur = sizeof(struct wlan_part_hdr);
++
++		/* Items live between the header and the uncached free mark. */
++		while (cur + sizeof(struct wlan_priv_entry) <= scan_end) {
++			const struct wlan_priv_entry *e =
++			    (const void *)(smem + off + cur);
++			if (e->canary != 0xa5a5) {
++				break;
++			}
++			uint32_t esize = wlan_le32(&e->size);
++			if (esize < sizeof(struct wlan_priv_entry) ||
++			    cur + esize > scan_end) {
++				break;
++			}
++			uint16_t eid = wlan_le16(&e->item);
++			uint32_t pad_hdr = wlan_le16(&e->padding_hdr);
++			uint32_t pad_data = wlan_le16(&e->padding_data);
++			uint32_t data_off = cur + sizeof(struct wlan_priv_entry) +
++			    pad_hdr + pad_data;
++			if (eid == item) {
++				uint32_t dsize = esize - sizeof(struct wlan_priv_entry) -
++				    pad_hdr - pad_data;
++				*out_size = dsize;
++				return (const uint8_t *)smem + off + data_off;
++			}
++			cur += esize;
++		}
++	}
++	return NULL;
++}
++
++static void
++wlan_collect(void)
++{
++	struct wlan_probe_state *st = &wlan_boot_state;
++	vm_offset_t smem, mss, icnss;
++	const uint8_t *item;
++	uint32_t size;
++
++	st->requested = 1;
++	printf("SWEET WLAN: reading SMEM (read-only, no writes)...\n");
++	smem = ml_io_map(WLAN_SMEM_PA, WLAN_SMEM_SIZE);
++	if (smem == 0) {
++		st->error = "smem map failed";
++		goto out;
++	}
++	st->smem_mapped = 1;
++	st->smem_initialized = wlan_read32(smem, SMEM_HDR_VERS + 0);
++	st->smem_free_offset = wlan_read32(smem, SMEM_HDR_VERS + 4);
++	st->smem_available = wlan_read32(smem, SMEM_HDR_VERS + 8);
++	for (unsigned int i = 0; i < 8; ++i) {
++		st->smem_version[i] = wlan_read32(smem, 16 + 4 * i);
++	}
++	printf("SWEET WLAN: smem initialized=0x%08x free=0x%08x available=0x%08x\n",
++	    st->smem_initialized, st->smem_free_offset, st->smem_available);
++
++	/* Partition table lives after the global heap; smem.c searches from
++	 * SMEM_PTABLE_OFF (0x400) for "$TOC". */
++	const struct wlan_ptable *pt = (const void *)(smem + WLAN_PTABLE_OFF);
++	if (pt->magic[0] == '$' && pt->magic[1] == 'T' &&
++	    pt->magic[2] == 'O' && pt->magic[3] == 'C') {
++		st->ptable_found = 1;
++		st->nparts = wlan_le32(&pt->num_entries);
++		if (st->nparts > 8) {
++			st->nparts = 8;
++		}
++		for (unsigned int i = 0; i < st->nparts; ++i) {
++			const struct wlan_ptable_entry *e = &pt->entry[i];
++			st->part[i].offset = wlan_le32(&e->offset);
++			st->part[i].size = wlan_le32(&e->size);
++			st->part[i].host0 = wlan_le16(&e->host0);
++			st->part[i].host1 = wlan_le16(&e->host1);
++		}
++		printf("SWEET WLAN: ptable found, %u partitions shown (of table)\n",
++		    st->nparts);
++		for (unsigned int i = 0; i < st->nparts; ++i) {
++			printf("SWEET WLAN: part %u off=0x%x size=0x%x hosts=%u/%u\n",
++			    i, st->part[i].offset, st->part[i].size,
++			    st->part[i].host0, st->part[i].host1);
++		}
++	} else {
++		st->error = "no $TOC ptable at 0x400";
++	}
++
++	/* Modem SMP2P items: inbound 435 (modem -> apps), outbound 428. */
++	item = wlan_find_item(smem, st, WLAN_MODEM_SMP2P_IN, &size);
++	if (item && size >= WLAN_SMP2P_HDR_BYTES) {
++		wlan_dump_smp2p(&st->smp2p_in, item, size);
++	} else {
++		st->smp2p_in.error = "inbound item 435 not found";
++	}
++	item = wlan_find_item(smem, st, WLAN_MODEM_SMP2P_OUT, &size);
++	if (item && size >= WLAN_SMP2P_HDR_BYTES) {
++		wlan_dump_smp2p(&st->smp2p_out, item, size);
++	} else {
++		st->smp2p_out.error = "outbound item 428 not found";
++	}
++
++	printf("SWEET WLAN: reading MSS QDSP6SS (read-only)...\n");
++	mss = ml_io_map(WLAN_MSS_PA, WLAN_MSS_SIZE);
++	if (mss == 0) {
++		st->error = st->error ? st->error : "mss map failed";
++		goto out;
++	}
++	for (unsigned int i = 0; i < WLAN_MSS_READS; ++i) {
++		st->mss[i] = wlan_read32(mss, wlan_mss_regs[i].off);
++	}
++	st->mss_done = 1;
++
++	printf("SWEET WLAN: reading icnss membase window (read-only)...\n");
++	icnss = ml_io_map(WLAN_ICNSS_PA, WLAN_ICNSS_SIZE);
++	if (icnss == 0) {
++		st->error = st->error ? st->error : "icnss map failed";
++		goto out;
++	}
++	for (unsigned int i = 0; i < WLAN_ICNSS_READS; ++i) {
++		st->icnss[i] = wlan_read32(icnss, wlan_icnss_regs[i].off);
++	}
++	st->icnss_done = 1;
++	st->modem_done = 1;
++
++out:
++	printf("SWEET WLAN: W0 probe complete, modem_done=%u error=%s\n",
++	    st->modem_done, st->error ? st->error : "none");
++}
++
++static void
++wlan_publish(void)
++{
++	const struct wlan_probe_state *st = &wlan_boot_state;
++
++	printf("SWEET WLAN: W0 requested=%u smem_mapped=%u initialized=0x%08x "
++	    "available=0x%08x ptable=%u (%s)\n",
++	    st->requested, st->smem_mapped, st->smem_initialized,
++	    st->smem_available, st->ptable_found,
++	    st->ptable_found ? "found" : "absent");
++	for (unsigned int i = 0; i < 8 && st->ptable_found; ++i) {
++		printf("SWEET WLAN: part %u off=0x%x size=0x%x hosts=%u/%u\n",
++		    i, st->part[i].offset, st->part[i].size,
++		    st->part[i].host0, st->part[i].host1);
++	}
++	for (unsigned int side = 0; side < 2; ++side) {
++		const struct wlan_smp2p_dump *d = side ? &st->smp2p_out : &st->smp2p_in;
++		printf("SWEET WLAN: smp2p %s found=%u magic=0x%08x ver=%u "
++		    "pids=%u->%u valid=%u entries=%u %s\n",
++		    side ? "out(428)" : "in(435)", d->found, d->magic, d->version,
++		    d->local_pid, d->remote_pid, d->valid_entries, d->nentries,
++		    d->error ? d->error : "");
++		for (unsigned int i = 0; i < d->nentries && i < WLAN_MAX_DUMP_ENTRIES; ++i) {
++			printf("SWEET WLAN: smp2p %s entry[%u] \"%s\" = 0x%08x\n",
++			    side ? "out" : "in", i, d->entry[i].name, d->entry[i].value);
++		}
++	}
++	if (st->mss_done) {
++		for (unsigned int i = 0; i < WLAN_MSS_READS; ++i) {
++			printf("SWEET WLAN: MSS %s +0x%x = 0x%08x\n",
++			    wlan_mss_regs[i].name, wlan_mss_regs[i].off, st->mss[i]);
++		}
++	}
++	if (st->icnss_done) {
++		for (unsigned int i = 0; i < WLAN_ICNSS_READS; ++i) {
++			printf("SWEET WLAN: icnss %s +0x%x = 0x%08x\n",
++			    wlan_icnss_regs[i].name, wlan_icnss_regs[i].off, st->icnss[i]);
++		}
++	}
++	printf("SWEET WLAN: W0 result: %s\n",
++	    st->error ? st->error :
++	    "read-only dump complete; no modem, rail or WLAN state was changed");
++}
++
++void
++sweet_wlan_probe(void)
++{
++	int mode = 0;
++
++	bzero(&wlan_boot_state, sizeof(wlan_boot_state));
++	if (!PE_parse_boot_argn("sweetwlan", &mode, sizeof(mode)) || mode == 0) {
++		return;
++	}
++	if (mode < 1 || mode > 1) {
++		printf("SWEET WLAN: unsupported sweetwlan=%d (only 1 = read-only W0 probe)\n",
++		    mode);
++		return;
++	}
++	wlan_collect();
++	wlan_publish();
++	__atomic_store_n(&wlan_state_ready, 1, __ATOMIC_RELEASE);
++}
++
++/* Called only by the USB log thread, after its configured grace periods. */
++void
++sweet_wlan_replay(void)
++{
++	if (__atomic_load_n(&wlan_state_ready, __ATOMIC_ACQUIRE)) {
++		printf("SWEET WLAN: replay %u\n", ++wlan_replay_count);
++		wlan_publish();
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
