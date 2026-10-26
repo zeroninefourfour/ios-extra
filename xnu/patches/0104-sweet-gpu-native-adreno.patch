@@ -10819,10 +10819,10 @@ index 0000000..55c6a93
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..036efdf
+index 0000000..0da2887
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,710 @@
+@@ -0,0 +1,712 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -11267,10 +11267,12 @@ index 0000000..036efdf
 +    svc_step("load-sqe");
 +    /* Load SQE microcode */
 +    if (reinterpret_cast<uintptr_t>(native_adreno_sqe_firmware_image) && native_adreno_sqe_firmware_image_size) {
-+        /* adreno_fw_create_bo copies fw->data + 4: the first dword is the firmware version, not an instruction. */
-+        const size_t copy_bytes = static_cast<size_t>(native_adreno_sqe_firmware_image_size) - 4;
++        /* The embedded image is /usr/lib/firmware/qcom/a630_sqe.fw WITHOUT its leading zero dword (image == file[4:], checked byte for byte),
++         * i.e. exactly what adreno_fw_create_bo puts in the BO. It must be copied whole; skipping 4 more bytes shifts the microcode by one
++         * instruction (4f9f3f3/e4970a4 did: the CP fetched the ring but never completed and the SMMU saw a stray translation fault). */
++        const size_t copy_bytes = static_cast<size_t>(native_adreno_sqe_firmware_image_size);
 +        memcpy(const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(0)).mapping(),
-+               native_adreno_sqe_firmware_image + 4, copy_bytes);
++               native_adreno_sqe_firmware_image, copy_bytes);
 +        const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(0)).publishForDevice(0, GpuSqeBytes, false);
 +        IOLog("NativeAdreno: SQE microcode published (%lu bytes at IOVA 0x%llx)\n",
 +            static_cast<unsigned long>(copy_bytes), static_cast<unsigned long long>(GpuSqeIova));
