@@ -7905,10 +7905,10 @@ index 0000000..f7ffec2
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoGmuService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoGmuService.cpp
 new file mode 100644
-index 0000000..fa0f518
+index 0000000..756ee3a
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoGmuService.cpp
-@@ -0,0 +1,502 @@
+@@ -0,0 +1,508 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * NativeAdreno GMU service for Adreno 618 (SM7150 / Sweet).
@@ -7963,8 +7963,8 @@ index 0000000..fa0f518
 +
 +#define GPU_SMMU_SMR            0x800
 +#define GPU_SMMU_S2CR           0xc00
-+#define GPU_SMMU_CBAR           0x000
-+#define GPU_SMMU_CBA2R          0x800
++#define GPU_SMMU_CBAR           0x1000
++#define GPU_SMMU_CBA2R          0x1800
 +#define GPU_SMMU_CB0            0x8000
 +#define GPU_SMMU_CB_SCTLR       0x00
 +#define GPU_SMMU_CB_TCR2        0x10
@@ -7972,14 +7972,14 @@ index 0000000..fa0f518
 +#define GPU_SMMU_CB_TCR         0x30
 +#define GPU_SMMU_CB_MAIR0       0x38
 +#define GPU_SMMU_CB_MAIR1       0x3c
-+#define GPU_SMMU_CB_TLB_SYNC    0x7f4
-+#define GPU_SMMU_CB_TLB_STATUS  0x7f8
++#define GPU_SMMU_CB_TLB_SYNC    0x7f0
++#define GPU_SMMU_CB_TLB_STATUS  0x7f4
 +#define GPU_SMMU_CB_TLB_INVALL  0x618
 +
 +#define GPU_SMMU_GMU_SID        5u
 +#define GPU_SMMU_GMU_CB         3u
 +#define GPU_PTE_TABLE           0x3ull
-+#define GPU_PTE_PAGE            ((1ull << 10) | (3ull << 8) | (2ull << 6) | 3ull)
++#define GPU_PTE_PAGE            (3ull | (1ull << 10) | (3ull << 8) | (1ull << 6) | (1ull << 11) | (1ull << 54))
 +
 +static const struct { unsigned char region; uint32_t off; uint32_t value; } gpu_rpmh_init[] = {
 +    { 0, GPU_RSCC_BASE + 0x0004 * 4, 1u << 24 },          /* disable SDE clock gating */
@@ -8290,14 +8290,19 @@ index 0000000..fa0f518
 +    /* Program SMMU CB3 */
 +    const uint32_t n = GPU_SMMU_GMU_CB;
 +    const uint32_t cb = GPU_SMMU_CB0 + n * 0x1000u;
++    /* Fault containment as in the verified probe: no global fault interrupts (sCR0 GFIE/GCFGFIE) */
++    const uint32_t scr0 = io_read32(smmu, 0x00);
++    io_write32(smmu, 0x00, scr0 & ~0x24u);
 +    io_write32(smmu, GPU_SMMU_CBA2R + 4 * n, 1);
 +    io_write32(smmu, GPU_SMMU_CBAR + 4 * n, 1u << 16);
++    gmu_step("smmu-cb-regs");
 +    io_write32(smmu, cb + GPU_SMMU_CB_TCR2, 1);
 +    io_write32(smmu, cb + GPU_SMMU_CB_TCR, 0x802020u);
 +    io_write64(smmu, cb + GPU_SMMU_CB_TTBR0, gmu_buf_pa);
 +    io_write32(smmu, cb + GPU_SMMU_CB_MAIR0, 0x44);
 +    io_write32(smmu, cb + GPU_SMMU_CB_MAIR1, 0);
 +
++    gmu_step("smmu-tlb");
 +    /* TLB invalidate & sync */
 +    io_write32(smmu, cb + GPU_SMMU_CB_TLB_INVALL, 0);
 +    io_write32(smmu, cb + GPU_SMMU_CB_TLB_SYNC, 0);
@@ -8305,6 +8310,7 @@ index 0000000..fa0f518
 +        if (!(io_read32(smmu, cb + GPU_SMMU_CB_TLB_STATUS) & 1u)) break;
 +        IODelay(1);
 +    }
++    gmu_step("smmu-enable");
 +    io_write32(smmu, cb + GPU_SMMU_CB_SCTLR, 0x27);
 +    io_write32(smmu, GPU_SMMU_S2CR + 4 * n, n);
 +    io_write32(smmu, GPU_SMMU_SMR + 4 * n, (1u << 31) | GPU_SMMU_GMU_SID);
