@@ -8668,10 +8668,10 @@ index 0000000..62abf77
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.cpp
 new file mode 100644
-index 0000000..6b1802b
+index 0000000..617afd2
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.cpp
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,137 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "NativeAdrenoGpuContext.h"
 +#include "ArmSmmu4KMmio.h"
@@ -8700,7 +8700,9 @@ index 0000000..6b1802b
 +    used_=true;
 +    IOReturn status=kIOReturnSuccess;
 +    auto step=[&](Step s) {report->step=s;if(progress)progress(s);};
++    ctx_mark("enter");
 +    step(Allocate);
++    ctx_mark("read-id2");
 +    static const uint8_t oas_bits[16]={32,36,40,42,44,48};
 +    if(io->read32(io->cookie,0x28,&report->id2))status=kIOReturnIOError;
 +    else {
@@ -10796,10 +10798,10 @@ index 0000000..55c6a93
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..bb54df2
+index 0000000..a17615c
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,679 @@
+@@ -0,0 +1,682 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -11203,7 +11205,9 @@ index 0000000..bb54df2
 +
 +    svc_step("gpu-smmu-context");
 +    /* Bring up GPU Context Bank 0 for Stream 0 (gfx3d_user) via ArmSmmu4K */
++    svc_step("gpu-ctx-new");
 +    gpu_ctx_ = new NativeAdrenoGpuContext();
++    svc_step("gpu-ctx-allocated");
 +    if (!gpu_ctx_) {
 +        IOLog("NativeAdreno: failed to allocate GPU context\n");
 +        smmu_svc->release();
@@ -11216,6 +11220,7 @@ index 0000000..bb54df2
 +    const unsigned gpu_slots[2] = { 0, 0 };
 +    const uint16_t gpu_sids[2] = { 0, 0 };
 +    NativeAdrenoGmuContextReport ctx_report{};
++    svc_step("gpu-ctx-bringup");
 +    IOReturn ctx_ret = gpu_ctx_->bringUp(&smmu_io, 0, 1, gpu_slots, gpu_sids, nullptr, &ctx_report);
 +    if (ctx_ret != kIOReturnSuccess || !gpu_ctx_->ready()) {
 +        IOLog("NativeAdreno: GPU SMMU context bringUp failed (0x%x, step %u)\n", ctx_ret, ctx_report.step);
