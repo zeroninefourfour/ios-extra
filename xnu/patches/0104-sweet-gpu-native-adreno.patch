@@ -10418,14 +10418,22 @@ index 0000000..570f464
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
 new file mode 100644
-index 0000000..36abe49
+index 0000000..2f6e73a
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,300 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "NativeAdrenoRing.h"
 +#include "AdrenoPM4.h"
 +#include <IOKit/IOLib.h>
++
++extern "C" void sweet_log_sync(void) __attribute__((weak));
++/* Write-ahead marker: the persistent log must hold the line before the access that may stall the SoC. */
++static void ring_mark(const char *what)
++{
++    IOLog("NativeAdrenoRing: %s\n", what);
++    if (sweet_log_sync) sweet_log_sync();
++}
 +
 +/* Values are taken from the pinned Linux source, not guessed:
 + * drivers/gpu/drm/msm/registers/adreno/a6xx.xml (register offsets), and
@@ -10499,6 +10507,7 @@ index 0000000..36abe49
 +IOReturn NativeAdrenoRing::readRptr(uint32_t *value)
 +{
 +    uint32_t rptr=0;
++    ring_mark("read RB_RPTR");
 +    if(io_.read32(io_.cookie,RingRptr,&rptr))return poison();
 +    if(rptr>=ring_bytes_/4)return poison(); /* unusable read pointer */
 +    *value=rptr;rptr_shadow_=rptr;return kIOReturnSuccess;
@@ -10669,7 +10678,9 @@ index 0000000..36abe49
 +    }
 +    if(cache_.publish(cache_.cookie,ring_,ring_bytes_))return poison();
 +    if(io_.barrier(io_.cookie))return poison();
++    ring_mark("write RB_WPTR");
 +    if(io_.write32(io_.cookie,RingWptr,end))return poison();
++    ring_mark("RB_WPTR written");
 +    next_=end;*fence=++seqno_;++submissions_;
 +    if(reset)reset_pending_=false;
 +    return kIOReturnSuccess;
@@ -10699,6 +10710,7 @@ index 0000000..36abe49
 +    if(!attached_ || poisoned_)return NativeAdrenoRingFencePoisoned;
 +    if(!fence || fence>seqno_)return NativeAdrenoRingFenceArgument;
 +    uint64_t start=clock && clock->now_us?clock->now_us(clock->cookie):0;
++    ring_mark("wait begin");
 +    for(;;) {
 +        if(cache_.acquire(cache_.cookie,fence_,fence_bytes_)) {poison();return NativeAdrenoRingFencePoisoned;}
 +        const uint32_t value=fence_[1];
@@ -10706,7 +10718,7 @@ index 0000000..36abe49
 +        if(value>=fence) {if(value>seqno_) {poison();return NativeAdrenoRingFencePoisoned;}completed_=value;
 +            return NativeAdrenoRingFenceComplete;}
 +        if(!clock || !clock->now_us)return NativeAdrenoRingFenceTimeout;
-+        if(clock->now_us(clock->cookie)-start>=timeout_us)return NativeAdrenoRingFenceTimeout;
++        if(clock->now_us(clock->cookie)-start>=timeout_us) {ring_mark("wait timeout");return NativeAdrenoRingFenceTimeout;}
 +        if(clock->idle && clock->idle(clock->cookie))return NativeAdrenoRingFenceTimeout;
 +    }
 +}
@@ -10819,10 +10831,10 @@ index 0000000..55c6a93
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..0da2887
+index 0000000..df68855
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,712 @@
+@@ -0,0 +1,716 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -11394,12 +11406,16 @@ index 0000000..0da2887
 +        teardown();
 +        return false;
 +    }
++    svc_step("cp-me-init-submitted");
 +    NativeAdrenoRingClock clock{ nullptr, ring_now, nullptr };
 +    if (ring_.wait(init_fence, &clock, 2000, nullptr) != NativeAdrenoRingFenceComplete) {
 +        IOLog("NativeAdreno: A6xx CP_ME_INIT fence %u timed out\n", init_fence);
++        if (sweet_log_sync) sweet_log_sync();
 +        {
-+            auto g = [&](uint32_t reg) { uint32_t v = 0xdeadbeef; (void)gpu_read32(&gpu_window, reg, &v); return (unsigned)v; };
-+            auto sm = [&](size_t at) { uint32_t v = 0xdeadbeef; (void)smmu_read32(&smmu_win, at, &v); return (unsigned)v; };
++            auto g = [&](uint32_t reg) { IOLog("NativeAdreno: DIAG read gpu reg 0x%x\n", (unsigned)reg); if (sweet_log_sync) sweet_log_sync();
++                uint32_t v = 0xdeadbeef; (void)gpu_read32(&gpu_window, reg, &v); return (unsigned)v; };
++            auto sm = [&](size_t at) { IOLog("NativeAdreno: DIAG read smmu 0x%x\n", (unsigned)at); if (sweet_log_sync) sweet_log_sync();
++                uint32_t v = 0xdeadbeef; (void)smmu_read32(&smmu_win, at, &v); return (unsigned)v; };
 +            /* The CP wrote memptrs behind the CPU's cache: invalidate before looking, like ring wait() does. */
 +            (void)const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(2)).acquireDeviceWrites(0, 64);
 +            const volatile uint32_t *mp = reinterpret_cast<const volatile uint32_t *>(
