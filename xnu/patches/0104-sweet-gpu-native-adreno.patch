@@ -7842,10 +7842,10 @@ index 0000000..f7ffec2
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoGmuService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoGmuService.cpp
 new file mode 100644
-index 0000000..44f903d
+index 0000000..78f3135
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoGmuService.cpp
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,476 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * NativeAdreno GMU service for Adreno 618 (SM7150 / Sweet).
@@ -7860,6 +7860,7 @@ index 0000000..44f903d
 +#include <IOKit/IOService.h>
 +#include <string.h>
 +#include "NativeAdrenoGmuService.h"
++#include "NativeAdrenoMemory.h"
 +
 +OSDefineMetaClassAndStructors(NativeAdrenoGmuService, IOService)
 +
@@ -7933,7 +7934,7 @@ index 0000000..44f903d
 +    { 2, 3 * 4, 0xbce3e284u },
 +    { 2, 4 * 4, 0x002081fcu },
 +    { 1, 0x1573 * 4, 7 }, { 1, 0x1574 * 4, 0 }, { 1, 0x1572 * 4, 0 },   /* TCS1 (sleep) */
-+    { 1, 0x1575 * 4, 0x10108 }, { 1, 0x1576 * 4, 0x30010 }, { 1, 0x1577 * 1 },
++    { 1, 0x1575 * 4, 0x10108 }, { 1, 0x1576 * 4, 0x30010 }, { 1, 0x1577 * 4, 1 },
 +    { 1, 0x1579 * 4, 0x10108 }, { 1, 0x157a * 4, 0x30000 }, { 1, 0x157b * 4, 0 },
 +    { 1, 0x157d * 4, 0x10108 }, { 1, 0x157e * 4, 0x30090 }, { 1, 0x157f * 4, 0 },
 +    { 1, 0x15d7 * 4, 7 }, { 1, 0x15d8 * 4, 0 }, { 1, 0x15d6 * 4, 0 },   /* TCS3 (wake), A618 data */
@@ -8196,6 +8197,11 @@ index 0000000..44f903d
 +        q[2] = (10u << 8) | (i ? 4 : 0);
 +        q[3] = 1024;
 +        q[6] = 1; q[7] = 1; q[8] = 1;
++    }
++    /* The SMMU and the GMU read these pages from DRAM: push the CPU's cached copy to the point of coherency first. */
++    if (NativeAdrenoMaintainOwnedPages(kva, 0xe000, NativeAdrenoClean) != kIOReturnSuccess) {
++        IOLog("NativeAdrenoGmu: cache clean of GMU page tables failed\n");
++        return kIOReturnIOError;
 +    }
 +    __builtin_arm_dsb(0xf);
 +
