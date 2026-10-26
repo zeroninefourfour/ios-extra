@@ -9364,10 +9364,10 @@ index 0000000..f91b19e
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp
 new file mode 100644
-index 0000000..ff3a564
+index 0000000..e5f7f74
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp
-@@ -0,0 +1,722 @@
+@@ -0,0 +1,726 @@
 +/* SPDX-License-Identifier: MIT */
 +/* IOKit surface for an already-running GPU context. The board code (kits/sheng) brings the GPU up, then hands this file
 + * the live VM, submit object, ring, clock and optional timer; one IOService is published and each IOServiceOpen creates a
@@ -9427,7 +9427,11 @@ index 0000000..ff3a564
 + * the newest complete blob to its export area. The render server sends its pipeline caches this way, so a later image can be built with them.
 + * Input: {generation, total, offset, bytes} then the bytes. No GPU state is touched; any connection of the render server may send it. */
 +enum : UInt32 {NativeAdrenoExportMethod=0x7100,NativeAdrenoExportMaxPiece=3968};
-+extern "C" int boot_log_export_put(uint32_t generation,uint32_t total,uint32_t offset,const void *data,uint32_t size) __attribute__((weak_import));
++extern "C" __attribute__((weak)) int boot_log_export_put(uint32_t generation,uint32_t total,uint32_t offset,const void *data,uint32_t size)
++{
++    (void)generation; (void)total; (void)offset; (void)data; (void)size;
++    return -1;
++}
 +extern "C" {volatile uint32_t native_adreno_export_stats[4];}   /* [0] pieces taken, [1] refused, [2] last generation, [3] its total bytes */
 +extern "C" IOMemoryDescriptor *native_gop_handoff_memory(void) __attribute__((weak));
 +
