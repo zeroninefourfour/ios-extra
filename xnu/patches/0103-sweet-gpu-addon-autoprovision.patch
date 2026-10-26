@@ -1,5 +1,5 @@
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 68612db..d9d333c 100644
+index 68612db..522f5c8 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -6870,6 +6870,345 @@ static const char * init_programs[] = {
@@ -175,7 +175,7 @@ index 68612db..d9d333c 100644
 +
 +	if (ram_size >= 2 && tar_ptr[0] == 0x1f && tar_ptr[1] == 0x8b) {
 +		printf("SWEET: native_gpu_addon: detected gzip payload (%llu bytes), decompressing...\n", ram_size);
-+		if (kmem_alloc(kernel_map, &decomp_buf, decomp_max, KMA_DATA, VM_KERN_MEMORY_NONE) == KERN_SUCCESS) {
++		if (kmem_alloc(kernel_map, &decomp_buf, decomp_max, KMA_DATA, VM_KERN_MEMORY_FILE) == KERN_SUCCESS) {
 +			z_stream zs;
 +			bzero(&zs, sizeof(zs));
 +			zs.next_in = (Bytef *)tar_ptr;
