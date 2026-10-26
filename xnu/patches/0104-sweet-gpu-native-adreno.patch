@@ -8917,13 +8917,14 @@ index 0000000..4a8d695
 +}
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoKernelTime.h b/iokit/Kernel/arm/adreno/NativeAdrenoKernelTime.h
 new file mode 100644
-index 0000000..b598b33
+index 0000000..af024fa
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoKernelTime.h
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,13 @@
 +/* SPDX-License-Identifier: MIT */
 +#ifndef NATIVE_ADRENO_KERNEL_TIME_H
 +#define NATIVE_ADRENO_KERNEL_TIME_H
++#include <stdint.h>
 +
 +/* Real kernel time for the GMU startup: monotonic microseconds from
 + * mach_absolute_time and a bounded busy wait. This is the only production
@@ -10631,10 +10632,10 @@ index 0000000..55c6a93
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..d6d99e6
+index 0000000..03df817
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,694 @@
+@@ -0,0 +1,596 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -10661,6 +10662,8 @@ index 0000000..d6d99e6
 +#include "NativeAdrenoSubmit.h"
 +#include "NativeAdrenoUserClient.h"
 +#include "NativeAdrenoA618HwInit.h"
++#include "AdrenoPM4.h"
++#include <IOKit/IOPlatformExpert.h>
 +
 +extern "C" const uint8_t native_adreno_firmware_image[] __attribute__((weak));
 +extern "C" const uint64_t native_adreno_firmware_image_size __attribute__((weak));
@@ -10672,12 +10675,11 @@ index 0000000..d6d99e6
 +extern "C" IOReturn native_adreno_publish(NativeAdrenoVm *vm,NativeAdrenoSubmit *submit,NativeAdrenoRing *ring,
 +    const NativeAdrenoRingClock *clock,const NativeAdrenoTimer *timer,const NativeAdrenoAbiDeviceInfo *info,
 +    uint32_t input_bits,uint32_t output_bits);
++extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t owningTask,void *securityID,UInt32 type,
++    OSDictionary *properties,IOUserClient **handler,unsigned limit);
 +
 +extern "C" { volatile uint64_t native_adreno_fence_phys = 0; }
 +extern "C" volatile uint32_t native_adreno_pool_mib;
-+
-+class NativeAdrenoGpuClient;
-+static IOUserClient *createGpuClient(task_t,void *,UInt32,OSDictionary *,NativeAdrenoUserClient *);
 +
 +struct NativeAdrenoSmmuWindow {
 +    volatile uint8_t *base;
@@ -10729,7 +10731,7 @@ index 0000000..d6d99e6
 +    OSSharedPtr<IOMemoryMap> maps_[2];
 +    OSSharedPtr<IOMemoryMap> gcc_map_;
 +    NativeAdrenoMemory gmu_mem_;
-+    NativeAdrenoGpuContext gpu_ctx_;
++    NativeAdrenoGpuContext *gpu_ctx_ = nullptr;
 +    NativeAdrenoRing ring_;
 +    NativeAdrenoSubmit *execbuf_ = nullptr;
 +    NativeAdrenoUserClient *core_ = nullptr;
@@ -10960,13 +10962,21 @@ index 0000000..d6d99e6
 +    }
 +
 +    /* Bring up GPU Context Bank 0 for Stream 0 (gfx3d_user) via ArmSmmu4K */
++    gpu_ctx_ = new NativeAdrenoGpuContext();
++    if (!gpu_ctx_) {
++        IOLog("NativeAdreno: failed to allocate GPU context\n");
++        smmu_svc->release();
++        gmu_svc->release();
++        stop(provider);
++        return false;
++    }
 +    NativeAdrenoSmmuWindow smmu_win{ smmu_base, smmu_bytes };
 +    ArmSmmu4KIo smmu_io{ &smmu_win, smmu_bytes, smmu_read32, smmu_read64, smmu_write32, smmu_write64, smmu_barrier };
 +    const unsigned gpu_slots[2] = { 0, 0 };
 +    const uint16_t gpu_sids[2] = { 0, 0 };
 +    NativeAdrenoGmuContextReport ctx_report{};
-+    IOReturn ctx_ret = gpu_ctx_.bringUp(&smmu_io, 0, 1, gpu_slots, gpu_sids, nullptr, &ctx_report);
-+    if (ctx_ret != kIOReturnSuccess || !gpu_ctx_.ready()) {
++    IOReturn ctx_ret = gpu_ctx_->bringUp(&smmu_io, 0, 1, gpu_slots, gpu_sids, nullptr, &ctx_report);
++    if (ctx_ret != kIOReturnSuccess || !gpu_ctx_->ready()) {
 +        IOLog("NativeAdreno: GPU SMMU context bringUp failed (0x%x, step %u)\n", ctx_ret, ctx_report.step);
 +        smmu_svc->release();
 +        gmu_svc->release();
@@ -10979,9 +10989,9 @@ index 0000000..d6d99e6
 +    /* Load SQE microcode */
 +    if (reinterpret_cast<uintptr_t>(native_adreno_sqe_firmware_image) && native_adreno_sqe_firmware_image_size) {
 +        const size_t copy_bytes = static_cast<size_t>(native_adreno_sqe_firmware_image_size);
-+        memcpy(const_cast<NativeAdrenoMemory &>(gpu_ctx_.buffer(0)).mapping(),
++        memcpy(const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(0)).mapping(),
 +               native_adreno_sqe_firmware_image, copy_bytes);
-+        const_cast<NativeAdrenoMemory &>(gpu_ctx_.buffer(0)).publishForDevice(0, GpuSqeBytes, false);
++        const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(0)).publishForDevice(0, GpuSqeBytes, false);
 +        IOLog("NativeAdreno: SQE microcode published (%lu bytes at IOVA 0x%llx)\n",
 +            static_cast<unsigned long>(copy_bytes), static_cast<unsigned long long>(GpuSqeIova));
 +    }
@@ -11067,13 +11077,13 @@ index 0000000..d6d99e6
 +    /* Attach NativeAdrenoRing */
 +    NativeAdrenoRingIo ring_io{ &gpu_window, gpu_write32, gpu_read32, gpu_barrier };
 +    ring_cache_ = {
-+        const_cast<NativeAdrenoMemory *>(&gpu_ctx_.buffer(1)),
-+        const_cast<NativeAdrenoMemory *>(&gpu_ctx_.buffer(2))
++        const_cast<NativeAdrenoMemory *>(&gpu_ctx_->buffer(1)),
++        const_cast<NativeAdrenoMemory *>(&gpu_ctx_->buffer(2))
 +    };
 +    NativeAdrenoRingCache ring_cache{ &ring_cache_, ring_publish, fence_acquire };
 +    IOReturn ring_ret = ring_.attach(&ring_io, &ring_cache,
-+        const_cast<NativeAdrenoMemory &>(gpu_ctx_.buffer(1)).mapping(), GpuRingBytes, GpuRingIova,
-+        const_cast<NativeAdrenoMemory &>(gpu_ctx_.buffer(2)).mapping(), GpuPageBytes, GpuMemptrsIova);
++        const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(1)).mapping(), GpuRingBytes, GpuRingIova,
++        const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(2)).mapping(), GpuPageBytes, GpuMemptrsIova);
 +    if (ring_ret != kIOReturnSuccess) {
 +        IOLog("NativeAdreno: ring attach failed (0x%x)\n", ring_ret);
 +        smmu_svc->release();
@@ -11082,8 +11092,8 @@ index 0000000..d6d99e6
 +        return false;
 +    }
 +
-+    if (gpu_ctx_.buffer(2).spanCount()) {
-+        native_adreno_fence_phys = gpu_ctx_.buffer(2).spans()[0].physical;
++    if (gpu_ctx_->buffer(2).spanCount()) {
++        native_adreno_fence_phys = gpu_ctx_->buffer(2).spans()[0].physical;
 +    }
 +
 +    /* 9. Run A6xx CP_ME_INIT */
@@ -11112,9 +11122,9 @@ index 0000000..d6d99e6
 +
 +    /* 10. Smoke Test: CP memory writeback */
 +    volatile uint32_t *scratch = reinterpret_cast<volatile uint32_t *>(
-+        const_cast<NativeAdrenoMemory &>(gpu_ctx_.buffer(4)).mapping());
++        const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(4)).mapping());
 +    scratch[0] = 0x00000000;
-+    const_cast<NativeAdrenoMemory &>(gpu_ctx_.buffer(4)).publishForDevice(0, 4, false);
++    const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(4)).publishForDevice(0, 4, false);
 +
 +    /* Submit PM4 CP_MEM_WRITE (opcode 0x3d, count 3) */
 +    uint32_t smoke_pm4[4];
@@ -11127,7 +11137,7 @@ index 0000000..d6d99e6
 +    IOReturn smoke_sub_ret = ring_.submit(smoke_pm4, 4, &smoke_fence);
 +    if (smoke_sub_ret == kIOReturnSuccess &&
 +        ring_.wait(smoke_fence, &clock, 2000, nullptr) == NativeAdrenoRingFenceComplete) {
-+        const_cast<NativeAdrenoMemory &>(gpu_ctx_.buffer(4)).acquireDeviceWrites(0, 4);
++        const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(4)).acquireDeviceWrites(0, 4);
 +        uint32_t val = scratch[0];
 +        if (val == 0xad618001u) {
 +            IOLog("NativeAdreno: Adreno 618 CP MEMORY WRITEBACK SMOKE TEST PASSED! Pattern 0x%08x verified\n", val);
@@ -11142,8 +11152,8 @@ index 0000000..d6d99e6
 +    execbuf_ = new NativeAdrenoSubmit;
 +    core_ = new NativeAdrenoUserClient;
 +    if (execbuf_ && core_ &&
-+        execbuf_->attach(gpu_ctx_.vm(), &ring_) == kIOReturnSuccess &&
-+        core_->open(NativeAdrenoAbiVersion, gpu_ctx_.vm(), execbuf_, &ring_, 32, 40) == kIOReturnSuccess) {
++        execbuf_->attach(gpu_ctx_->vm(), &ring_) == kIOReturnSuccess &&
++        core_->open(NativeAdrenoAbiVersion, gpu_ctx_->vm(), execbuf_, &ring_, 32, 40) == kIOReturnSuccess) {
 +        core_ready_ = true;
 +    }
 +
@@ -11177,7 +11187,7 @@ index 0000000..d6d99e6
 +    dev_info.macrotile_mode = 0;
 +    dev_info.ubwc_version = 2;
 +
-+    native_adreno_publish(gpu_ctx_.vm(), execbuf_, &ring_, &clock, nullptr, &dev_info, 32, 40);
++    native_adreno_publish(gpu_ctx_->vm(), execbuf_, &ring_, &clock, nullptr, &dev_info, 32, 40);
 +
 +    ready_ = true;
 +    IOLog("NativeAdreno: GPU driver fully ready, publishing service\n");
@@ -11203,6 +11213,10 @@ index 0000000..d6d99e6
 +        delete execbuf_;
 +        execbuf_ = nullptr;
 +    }
++    if (gpu_ctx_) {
++        delete gpu_ctx_;
++        gpu_ctx_ = nullptr;
++    }
 +    gcc_map_.reset();
 +    for (auto &map : maps_) map.reset();
 +    ready_ = false;
@@ -11210,124 +11224,13 @@ index 0000000..d6d99e6
 +    IOService::stop(provider);
 +}
 +
-+IOReturn NativeAdrenoGpuService::newUserClient(task_t owningTask,void *securityID,
-+    UInt32 type,OSDictionary *properties,IOUserClient **handler)
++IOReturn NativeAdrenoGpuService::newUserClient(task_t owningTask, void *securityID,
++    UInt32 type, OSDictionary *properties, IOUserClient **handler)
 +{
-+    if (handler) *handler = nullptr;
-+    if (!core_ready_) return kIOReturnNotReady;
-+    IOUserClient *client = createGpuClient(owningTask,securityID,type,properties,core_);
-+    if (!client) return kIOReturnNoResources;
-+    if (handler) *handler = client;
-+    return kIOReturnSuccess;
-+}
-+
-+class NativeAdrenoGpuClient : public IOUserClient {
-+    OSDeclareDefaultStructors(NativeAdrenoGpuClient)
-+    NativeAdrenoUserClient *core_ = nullptr;
-+    task_t task_ = TASK_NULL;
-+    static IOReturn action(OSObject *target,void *reference,
-+        IOExternalMethodArguments *arguments);
-+public:
-+    void setCore(NativeAdrenoUserClient *core) { core_ = core; }
-+    bool initWithTask(task_t owningTask,void *securityID,UInt32 type,
-+        OSDictionary *properties) APPLE_KEXT_OVERRIDE;
-+    IOReturn clientClose() APPLE_KEXT_OVERRIDE;
-+    IOReturn clientMemoryForType(UInt32 type,IOOptionBits *options,
-+        IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
-+    IOReturn externalMethod(uint32_t selector,IOExternalMethodArguments *arguments,
-+        IOExternalMethodDispatch *dispatch,OSObject *target,
-+        void *reference) APPLE_KEXT_OVERRIDE;
-+};
-+OSDefineMetaClassAndStructors(NativeAdrenoGpuClient,IOUserClient)
-+
-+bool NativeAdrenoGpuClient::initWithTask(task_t owningTask,void *securityID,
-+    UInt32 type,OSDictionary *properties)
-+{
-+    if (!IOUserClient::initWithTask(owningTask,securityID,type,properties)) return false;
-+    task_ = owningTask;
-+    return true;
-+}
-+
-+IOReturn NativeAdrenoGpuClient::clientClose()
-+{
-+    core_ = nullptr;
-+    task_ = TASK_NULL;
-+    terminate();
-+    return kIOReturnSuccess;
-+}
-+
-+IOReturn NativeAdrenoGpuClient::clientMemoryForType(UInt32 type,IOOptionBits *options,
-+    IOMemoryDescriptor **memory)
-+{
-+    if (memory) *memory = nullptr;
-+    if (options) *options = 0;
-+    return kIOReturnUnsupported;
-+}
-+
-+IOReturn NativeAdrenoGpuClient::action(OSObject *target,void *reference,
-+    IOExternalMethodArguments *arguments)
-+{
-+    NativeAdrenoGpuClient *client = OSDynamicCast(NativeAdrenoGpuClient,target);
-+    if (!client || !client->core_ || !reference) return kIOReturnBadArgument;
-+    const uint32_t method = *static_cast<const uint32_t *>(reference);
-+    const void *in = arguments ? arguments->structureInput : nullptr;
-+    const size_t in_size = arguments ? arguments->structureInputSize : 0;
-+    void *out = arguments ? arguments->structureOutput : nullptr;
-+    size_t out_size = arguments ? arguments->structureOutputSize : 0;
-+    uint32_t out_written = 0;
-+    const IOReturn result = client->core_->dispatch(method,in,in_size,out,out_size,&out_written);
-+    if (arguments && !result) arguments->structureOutputSize = out_written;
-+    return result;
-+}
-+
-+IOReturn NativeAdrenoGpuClient::externalMethod(uint32_t selector,IOExternalMethodArguments *arguments,
-+    IOExternalMethodDispatch *dispatch,OSObject *target,void *reference)
-+{
-+    static const uint32_t methods[] = {
-+        NativeAdrenoMethodBoAlloc, NativeAdrenoMethodBoFree, NativeAdrenoMethodBoMap,
-+        NativeAdrenoMethodBoUnmap, NativeAdrenoMethodSubmit, NativeAdrenoMethodWaitFence,
-+        NativeAdrenoMethodQueryFence, NativeAdrenoMethodSetMetadata, NativeAdrenoMethodGetMetadata,
-+        NativeAdrenoMethodQueueCreate, NativeAdrenoMethodQueueDestroy, NativeAdrenoMethodBoCpuMap,
-+        NativeAdrenoMethodBoCpuUnmap, NativeAdrenoMethodDeviceInfo, NativeAdrenoMethodBoImport
-+    };
-+    static const IOExternalMethodDispatch table[] = {
-+        {&action,0,sizeof(NativeAdrenoAbiBoAlloc),0,sizeof(NativeAdrenoAbiBoAllocReply)},
-+        {&action,0,sizeof(NativeAdrenoAbiBoFree),0,0},
-+        {&action,0,sizeof(NativeAdrenoAbiBoMap),0,sizeof(NativeAdrenoAbiBoMapReply)},
-+        {&action,0,sizeof(NativeAdrenoAbiBoUnmap),0,0},
-+        {&action,0,sizeof(NativeAdrenoAbiSubmit),0,sizeof(NativeAdrenoAbiSubmitReply)},
-+        {&action,0,sizeof(NativeAdrenoAbiWaitFence),0,0},
-+        {&action,0,sizeof(NativeAdrenoAbiQueryFence),0,sizeof(NativeAdrenoAbiQueryFenceReply)},
-+        {&action,0,sizeof(NativeAdrenoAbiMetadata),0,0},
-+        {&action,0,sizeof(NativeAdrenoAbiMetadata),0,sizeof(NativeAdrenoAbiMetadata)},
-+        {&action,0,sizeof(NativeAdrenoAbiQueue),0,sizeof(NativeAdrenoAbiQueueReply)},
-+        {&action,0,sizeof(NativeAdrenoAbiQueue),0,0},
-+        {&action,0,sizeof(NativeAdrenoAbiBoCpuMap),0,sizeof(NativeAdrenoAbiBoCpuMapReply)},
-+        {&action,0,sizeof(NativeAdrenoAbiBoCpuUnmap),0,0},
-+        {&action,0,0,0,sizeof(NativeAdrenoAbiDeviceInfo)},
-+        {&action,0,sizeof(NativeAdrenoAbiBoImport),0,sizeof(NativeAdrenoAbiBoAllocReply)}
-+    };
-+    if (selector < 1 || selector > sizeof(table) / sizeof(table[0]))
-+        return kIOReturnUnsupported;
-+    return IOUserClient::externalMethod(selector,arguments,
-+        const_cast<IOExternalMethodDispatch *>(&table[selector - 1]),
-+        target ? target : this,
-+        const_cast<void *>(static_cast<const void *>(&methods[selector - 1])));
-+}
-+
-+static IOUserClient *createGpuClient(task_t owningTask,void *securityID,UInt32 type,
-+    OSDictionary *properties,NativeAdrenoUserClient *core)
-+{
-+    (void)type;
-+    (void)properties;
-+    NativeAdrenoGpuClient *client = new NativeAdrenoGpuClient;
-+    if (!client) return nullptr;
-+    if (!client->initWithTask(owningTask,securityID,type,properties)) {
-+        client->release();
-+        return nullptr;
++    if (native_adreno_new_user_client) {
++        return native_adreno_new_user_client(this, owningTask, securityID, type, properties, handler, 40);
 +    }
-+    client->setCore(core);
-+    return client;
++    return kIOReturnUnsupported;
 +}
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoSha256.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoSha256.cpp
 new file mode 100644
