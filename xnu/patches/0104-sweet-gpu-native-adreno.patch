@@ -11,6 +11,86 @@ index 0d1176b..ebe0e6d 100644
  		val = gpu_read32(gmu, 0x14648);
  		r->oob_polls = i + 1;
  		if (val & (1u << 30)) {
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 0efc068..3579a4e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_gpu_probe(void);
++extern void sweet_wlan_probe(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -662,6 +663,7 @@ sweet_ufs_init(void)
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
+ 	sweet_gpu_probe();
++	sweet_wlan_probe();
+ 	return 0;
+ }
+ 
+@@ -686,6 +688,8 @@ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
++static uint64_t _Atomic sweet_log_flushed_total;
++static int _Atomic sweet_log_running;
+ 
+ /* Called for all console output, any context: never blocks. */
+ void sweet_log_append(const char *c, int size);
+@@ -747,6 +751,7 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 
+ 	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+ 	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
++	os_atomic_store(&sweet_log_running, 1, relaxed);
+ 	for (;;) {
+ 		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
+ 		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
+@@ -782,9 +787,42 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 		lck_mtx_unlock(&sweet_ufs_lock);
+ 		if (error) {
+ 			printf("SWEET LOG: write failed (%d), stopping\n", error);
++			os_atomic_store(&sweet_log_running, 0, relaxed);
+ 			return;
+ 		}
+ 		flushed = total;
++		os_atomic_store(&sweet_log_flushed_total, total, relaxed);
++		wakeup(&sweet_log_flushed_total);
++	}
++}
++
++/* True once the persistent log thread is running and able to flush. */
++int sweet_log_ready(void);
++
++int
++sweet_log_ready(void)
++{
++	return os_atomic_load(&sweet_log_running, relaxed);
++}
++
++/*
++ * Write everything printed so far to the persistent log and wait (up to
++ * ~3 s) until it is on the device. For code that is about to do something
++ * that may reset the machine: print the step, call this, then do the step.
++ */
++void sweet_log_sync(void);
++
++void
++sweet_log_sync(void)
++{
++	if (!sweet_log_ready()) {
++		return;
++	}
++	uint64_t target = os_atomic_load(&sweet_log_total, relaxed);
++	wakeup(&sweet_log_chan);
++	for (int i = 0; i < 300 && sweet_log_ready() &&
++	    os_atomic_load(&sweet_log_flushed_total, relaxed) < target; i++) {
++		(void)tsleep(&sweet_log_flushed_total, PZERO, "sweetsync", 1);
+ 	}
+ }
+ 
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 index a62416c..c7f2f48 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
@@ -7842,10 +7922,10 @@ index 0000000..f7ffec2
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoGmuService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoGmuService.cpp
 new file mode 100644
-index 0000000..78f3135
+index 0000000..fa0f518
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoGmuService.cpp
-@@ -0,0 +1,476 @@
+@@ -0,0 +1,502 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * NativeAdreno GMU service for Adreno 618 (SM7150 / Sweet).
@@ -7867,6 +7947,14 @@ index 0000000..78f3135
 +extern "C" const uint8_t native_adreno_firmware_image[] __attribute__((weak));
 +extern "C" const uint64_t native_adreno_firmware_image_size __attribute__((weak));
 +
++extern "C" int sweet_log_ready(void) __attribute__((weak));
++extern "C" void sweet_log_sync(void) __attribute__((weak));
++/* Print a step marker and force it onto the persistent log before the step runs: a reset in the step leaves the marker behind. */
++static void gmu_step(const char *name)
++{
++    IOLog("NativeAdrenoGmu: STEP %s\n", name);
++    if (sweet_log_sync) sweet_log_sync();
++}
 +extern "C" int sweet_rpmh_arc_set(const char *res, unsigned corner, unsigned *level) __attribute__((weak));
 +
 +#define GPU_RSCC_BASE           0x00023000
@@ -8070,6 +8158,7 @@ index 0000000..78f3135
 +
 +    IOLog("NativeAdrenoGmu: starting A618 cold start sequence\n");
 +
++    gmu_step("rpmh-arc-votes");
 +    /* 1. RPMh ARC rail votes: MX and CX at LOW_SVS (64) */
 +    if (sweet_rpmh_arc_set) {
 +        unsigned mx_level = 0, cx_level = 0;
@@ -8081,6 +8170,7 @@ index 0000000..78f3135
 +        }
 +    }
 +
++    gmu_step("cx-gdsc-uncollapse");
 +    /* 2. CX GDSC power domain uncollapse */
 +    uint32_t cx_val = io_read32(cc, GPU_CX_GDSCR);
 +    io_write32(cc, GPU_CX_GDSCR, cx_val & ~GPU_GDSC_SW_COLLAPSE);
@@ -8099,11 +8189,13 @@ index 0000000..78f3135
 +    }
 +    IODelay(5);
 +
++    gmu_step("gpll0-gate-vote");
 +    /* 3. GPLL0 divider gate vote */
 +    uint32_t gate = io_read32(gcc, GPU_GCC_GPU_GPLL_VOTE);
 +    io_write32(gcc, GPU_GCC_GPU_GPLL_VOTE, gate | GPU_GPLL0_DIV_GATE);
 +    IODelay(5);
 +
++    gmu_step("gmu-rcg-200mhz");
 +    /* 4. GMU RCG 200 MHz */
 +    uint32_t rcg_cfg = io_read32(cc, GPU_GMU_RCG_CFG);
 +    io_write32(cc, GPU_GMU_RCG_CFG, (rcg_cfg & ~((7u << 8) | 0x1fu)) | GPU_GMU_RCG_200MHZ);
@@ -8121,6 +8213,7 @@ index 0000000..78f3135
 +        return kIOReturnTimeout;
 +    }
 +
++    gmu_step("gpucc-branches");
 +    /* 5. GPU CC branches */
 +    io_write32(cc, GPU_CC_AHB, GPU_BRANCH_ENABLE);
 +    io_write32(cc, GPU_CC_CX_GMU, GPU_BRANCH_ENABLE | GPU_CBCR_WAKE_SLEEP);
@@ -8133,6 +8226,7 @@ index 0000000..78f3135
 +        IODelay(1);
 +    }
 +
++    gmu_step("gcc-bus-branches");
 +    /* 6. GCC bus branches */
 +    io_write32(gcc, GPU_GCC_MEMNOC_GFX, GPU_BRANCH_ENABLE);
 +    io_write32(gcc, GPU_GCC_DDRSS_GPU_AXI, GPU_BRANCH_ENABLE);
@@ -8143,6 +8237,7 @@ index 0000000..78f3135
 +        IODelay(1);
 +    }
 +
++    gmu_step("gmu-firmware-to-tcm");
 +    /* 7. Load firmware into GMU TCM at +0x3000 */
 +    if (!reinterpret_cast<uintptr_t>(native_adreno_firmware_image) ||
 +        native_adreno_firmware_image_size < 32768) {
@@ -8155,11 +8250,13 @@ index 0000000..78f3135
 +        io_write32(gmu, 0x3000 + static_cast<uint32_t>(i * 4), fw_words[i]);
 +    }
 +
++    gmu_step("rscc-pdc-table");
 +    /* 8. Program 48-entry RSCC / PDC table */
 +    volatile uint8_t *bases[3] = { gmu, pdc, seq };
 +    for (unsigned i = 0; i < GPU_RPMH_INIT_COUNT; i++) {
 +        io_write32(bases[gpu_rpmh_init[i].region], gpu_rpmh_init[i].off, gpu_rpmh_init[i].value);
 +    }
++    gmu_step("rscc-stop-handshake");
 +    /* RSCC stop handshake */
 +    io_write32(gmu, 0x9307 * 4, 1u);
 +    bool stop_done = false;
@@ -8176,6 +8273,7 @@ index 0000000..78f3135
 +        return kIOReturnTimeout;
 +    }
 +
++    gmu_step("format-gmu-page-tables");
 +    /* 9. Format GMU SMMU page tables at gmu_buf_kva */
 +    uint8_t *kva = static_cast<uint8_t *>(gmu_buf_kva);
 +    memset(kva, 0, 0xe000);
@@ -8205,6 +8303,7 @@ index 0000000..78f3135
 +    }
 +    __builtin_arm_dsb(0xf);
 +
++    gmu_step("program-smmu-cb3");
 +    /* Program SMMU CB3 */
 +    const uint32_t n = GPU_SMMU_GMU_CB;
 +    const uint32_t cb = GPU_SMMU_CB0 + n * 0x1000u;
@@ -8227,10 +8326,12 @@ index 0000000..78f3135
 +    io_write32(smmu, GPU_SMMU_S2CR + 4 * n, n);
 +    io_write32(smmu, GPU_SMMU_SMR + 4 * n, (1u << 31) | GPU_SMMU_GMU_SID);
 +
++    gmu_step("mask-irqs");
 +    /* 10. Mask interrupt sources */
 +    io_write32(gmu, 0x24c18, ~0u);
 +    io_write32(gmu, 0x1464c, ~0u);
 +
++    gmu_step("gmu-boot-config");
 +    /* 11. GMU boot configuration */
 +    io_write32(gmu, 0x14070, 0);
 +    io_write32(gmu, 0x14004, 0x02);
@@ -8247,6 +8348,7 @@ index 0000000..78f3135
 +    io_write32(gmu, 0x143a0, io_read32(gmu, 0x143a0) | 0x00000f11);
 +    io_write32(gmu, 0x14404, 0);
 +
++    gmu_step("release-cm3");
 +    /* 12. Release CM3 reset & poll FW_INIT_RESULT */
 +    IOLog("NativeAdrenoGmu: releasing CM3 processor from reset\n");
 +    io_write32(gmu, 0x14000, 0);
@@ -8267,11 +8369,13 @@ index 0000000..78f3135
 +    }
 +    IOLog("NativeAdrenoGmu: CM3 FW initialized successfully (result 0x%08x)\n", init_res);
 +
++    gmu_step("gx-rail-vote");
 +    /* 13. GX Rail vote, OOB BOOT_SLUMBER, SPTPRAC, and HFI */
 +    io_write32(gmu, 0x8fe0, 0);
 +    io_write32(gmu, 0x8fe4, 7); // GX Turbo = 7
 +    io_write32(gmu, 0x8fe8, 3); // MX Nominal = 3
 +
++    gmu_step("oob-boot-slumber");
 +    /* Request OOB BOOT_SLUMBER (bit 22), poll ACK (bit 30) */
 +    io_write32(gmu, 0x14650, 1u << 22);
 +    bool oob_done = false;
@@ -8288,6 +8392,7 @@ index 0000000..78f3135
 +        return kIOReturnTimeout;
 +    }
 +
++    gmu_step("sptprac");
 +    /* Enable SPTPRAC shader core cluster power */
 +    io_write32(gmu, 0x204, 0x778000);
 +    bool sptprac_done = false;
@@ -8303,6 +8408,7 @@ index 0000000..78f3135
 +        return kIOReturnTimeout;
 +    }
 +
++    gmu_step("start-hfi");
 +    /* Start HFI */
 +    io_write32(gmu, 0x14618, 1);
 +    bool hfi_done = false;
@@ -10648,10 +10754,10 @@ index 0000000..55c6a93
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..82edef2
+index 0000000..bb54df2
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,658 @@
+@@ -0,0 +1,679 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -10686,6 +10792,14 @@ index 0000000..82edef2
 +extern "C" const uint64_t native_adreno_firmware_image_size __attribute__((weak));
 +extern "C" const uint8_t native_adreno_sqe_firmware_image[] __attribute__((weak));
 +extern "C" const uint64_t native_adreno_sqe_firmware_image_size __attribute__((weak));
++
++extern "C" int sweet_log_ready(void) __attribute__((weak));
++extern "C" void sweet_log_sync(void) __attribute__((weak));
++static void svc_step(const char *name)
++{
++    IOLog("NativeAdreno: STEP %s\n", name);
++    if (sweet_log_sync) sweet_log_sync();
++}
 +
 +extern "C" IOService *native_adreno_accelerator_allocate(void) __attribute__((weak));
 +extern "C" unsigned native_adreno_accelerator_instance_size(void) __attribute__((weak));
@@ -10952,6 +11066,11 @@ index 0000000..82edef2
 +    if (!found) {
 +        IOLog("NativeAdreno: GMU/SMMU services never appeared\n");
 +    } else {
++        /* The persistent log thread starts after UFS comes up; bring-up must not run before it, or a reset leaves no trace. */
++        if (sweet_log_ready) {
++            for (unsigned tries = 0; tries < 600 && !sweet_log_ready(); ++tries) IOSleep(100);
++            IOSleep(500);
++        }
 +        IOLog("NativeAdreno: GMU and SMMU services present, starting bring-up\n");
 +        if (!self->bringUp()) IOLog("NativeAdreno: bring-up failed, AGXAccelerator not published\n");
 +    }
@@ -11029,6 +11148,7 @@ index 0000000..82edef2
 +    volatile uint8_t *gcc_base = reinterpret_cast<volatile uint8_t *>(gcc_map_->getVirtualAddress());
 +    volatile uint8_t *cx_base = reinterpret_cast<volatile uint8_t *>(maps_[1]->getVirtualAddress());
 +
++    svc_step("gmu-cold-start");
 +    /* Execute A618 Cold Start on GMU */
 +    IOReturn gmu_start_ret = gmu_node->coldStartA618(gcc_base, cx_base, smmu_base, gmu_buf_pa, gmu_buf_kva);
 +    if (gmu_start_ret != kIOReturnSuccess) {
@@ -11039,6 +11159,7 @@ index 0000000..82edef2
 +        return false;
 +    }
 +
++    svc_step("gpu-smmu-context");
 +    /* Bring up GPU Context Bank 0 for Stream 0 (gfx3d_user) via ArmSmmu4K */
 +    gpu_ctx_ = new NativeAdrenoGpuContext();
 +    if (!gpu_ctx_) {
@@ -11064,6 +11185,7 @@ index 0000000..82edef2
 +    IOLog("NativeAdreno: GPU SMMU context ready (Bank 0, SID 0, TTBR0=0x%llx)\n",
 +        static_cast<unsigned long long>(ctx_report.ttbr0));
 +
++    svc_step("load-sqe");
 +    /* Load SQE microcode */
 +    if (reinterpret_cast<uintptr_t>(native_adreno_sqe_firmware_image) && native_adreno_sqe_firmware_image_size) {
 +        const size_t copy_bytes = static_cast<size_t>(native_adreno_sqe_firmware_image_size);
@@ -11074,6 +11196,7 @@ index 0000000..82edef2
 +            static_cast<unsigned long>(copy_bytes), static_cast<unsigned long long>(GpuSqeIova));
 +    }
 +
++    svc_step("cp-register-init");
 +    /* Initialize Adreno 618 CP hardware */
 +    NativeAdrenoGpuWindow gpu_window = {
 +        reinterpret_cast<volatile uint8_t *>(maps_[0]->getVirtualAddress()),
@@ -11149,6 +11272,7 @@ index 0000000..82edef2
 +    gpu_write32(&gpu_window, A618_CP_RB_RPTR, 0);
 +    gpu_write32(&gpu_window, A618_CP_RB_WPTR, 0);
 +
++    svc_step("start-sqe");
 +    /* 8. Start SQE microcode */
 +    gpu_write32(&gpu_window, A618_CP_SQE_CNTL, 1);
 +
@@ -11174,6 +11298,7 @@ index 0000000..82edef2
 +        native_adreno_fence_phys = gpu_ctx_->buffer(2).spans()[0].physical;
 +    }
 +
++    svc_step("cp-me-init");
 +    /* 9. Run A6xx CP_ME_INIT */
 +    NativeAdrenoCpInit cp;
 +    uint32_t init_fence = 0;
@@ -11198,6 +11323,7 @@ index 0000000..82edef2
 +    /* Switch out of secure mode */
 +    gpu_write32(&gpu_window, A618_RBBM_SECVID_TRUST_CNTL, 0);
 +
++    svc_step("smoke-test");
 +    /* 10. Smoke Test: CP memory writeback */
 +    volatile uint32_t *scratch = reinterpret_cast<volatile uint32_t *>(
 +        const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(4)).mapping());
@@ -11235,6 +11361,7 @@ index 0000000..82edef2
 +        core_ready_ = true;
 +    }
 +
++    svc_step("publish-agx");
 +    /* 11. Register AGXAccelerator into IORegistry with sandbox grant properties */
 +    if (native_adreno_accelerator_allocate) {
 +        accelerator_ = native_adreno_accelerator_allocate();
