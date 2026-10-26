@@ -7905,10 +7905,10 @@ index 0000000..f7ffec2
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoGmuService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoGmuService.cpp
 new file mode 100644
-index 0000000..756ee3a
+index 0000000..61b8b65
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoGmuService.cpp
-@@ -0,0 +1,508 @@
+@@ -0,0 +1,548 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * NativeAdreno GMU service for Adreno 618 (SM7150 / Sweet).
@@ -8220,19 +8220,6 @@ index 0000000..756ee3a
 +        IODelay(1);
 +    }
 +
-+    gmu_step("gmu-firmware-to-tcm");
-+    /* 7. Load firmware into GMU TCM at +0x3000 */
-+    if (!reinterpret_cast<uintptr_t>(native_adreno_firmware_image) ||
-+        native_adreno_firmware_image_size < 32768) {
-+        IOLog("NativeAdrenoGmu: embedded GMU firmware missing or truncated\n");
-+        return kIOReturnNoResources;
-+    }
-+    const uint32_t *fw_words = reinterpret_cast<const uint32_t *>(native_adreno_firmware_image);
-+    const size_t fw_dwords = 32768 / 4;
-+    for (size_t i = 0; i < fw_dwords; i++) {
-+        io_write32(gmu, 0x3000 + static_cast<uint32_t>(i * 4), fw_words[i]);
-+    }
-+
 +    gmu_step("rscc-pdc-table");
 +    /* 8. Program 48-entry RSCC / PDC table */
 +    volatile uint8_t *bases[3] = { gmu, pdc, seq };
@@ -8254,6 +8241,44 @@ index 0000000..756ee3a
 +    if (!stop_done) {
 +        IOLog("NativeAdrenoGmu: RSCC stop handshake timed out\n");
 +        return kIOReturnTimeout;
++    }
++
++    gmu_step("rsc-wake");
++    /* Mainline a6xx_gmu_fw_start(): TCM retention, then a6xx_rpmh_start() wakes the RSC before firmware load */
++    io_write32(gmu, 0x14730, 1u);
++    io_write32(gmu, 0x24c1c, 2u);
++    bool wake_ack = false;
++    for (unsigned i = 0; i < 100; i++) {
++        if (io_read32(gmu, 0x24c20) & 2u) { wake_ack = true; break; }
++        IODelay(100);
++    }
++    if (!wake_ack) {
++        io_write32(gmu, 0x24c1c, 0u);
++        IOLog("NativeAdrenoGmu: RSC wake ACK timed out (0x%08x)\n", io_read32(gmu, 0x24c20));
++        return kIOReturnTimeout;
++    }
++    bool seq_idle = false;
++    for (unsigned i = 0; i < 100; i++) {
++        if (io_read32(gmu, 0x23404) == 0) { seq_idle = true; break; }
++        IODelay(100);
++    }
++    io_write32(gmu, 0x24c1c, 0u);
++    if (!seq_idle) {
++        IOLog("NativeAdrenoGmu: RSC sequencer stuck while waking (0x%08x)\n", io_read32(gmu, 0x23404));
++        return kIOReturnTimeout;
++    }
++
++    gmu_step("gmu-firmware-to-tcm");
++    /* 7. Load firmware into GMU TCM at +0x3000 */
++    if (!reinterpret_cast<uintptr_t>(native_adreno_firmware_image) ||
++        native_adreno_firmware_image_size < 32768) {
++        IOLog("NativeAdrenoGmu: embedded GMU firmware missing or truncated\n");
++        return kIOReturnNoResources;
++    }
++    const uint32_t *fw_words = reinterpret_cast<const uint32_t *>(native_adreno_firmware_image);
++    const size_t fw_dwords = 32768 / 4;
++    for (size_t i = 0; i < fw_dwords; i++) {
++        io_write32(gmu, 0x3000 + static_cast<uint32_t>(i * 4), fw_words[i]);
 +    }
 +
 +    gmu_step("format-gmu-page-tables");
@@ -8378,6 +8403,21 @@ index 0000000..756ee3a
 +    io_write32(gmu, 0x14644, 1u << 30); // acknowledge
 +    if (!oob_done) {
 +        IOLog("NativeAdrenoGmu: OOB BOOT_SLUMBER handshake timed out\n");
++        IOLog("NativeAdrenoGmu: DIAG intr_info=0x%08x intr_mask=0x%08x ao_irq=0x%08x fw_busy=0x%08x init=0x%08x sysreset=0x%08x\n",
++              io_read32(gmu, 0x14648), io_read32(gmu, 0x1464c), io_read32(gmu, 0x24c14),
++              io_read32(gmu, 0x14068), io_read32(gmu, 0x14070), io_read32(gmu, 0x14000));
++        IOLog("NativeAdrenoGmu: DIAG rsc ctrl_req=0x%08x ctrl_ack=0x%08x seq_busy=0x%08x status0=0x%08x sptprac=0x%08x hfi=0x%08x\n",
++              io_read32(gmu, 0x24c1c), io_read32(gmu, 0x24c20), io_read32(gmu, 0x23404),
++              io_read32(gmu, 0x23010), io_read32(gmu, 0x14340), io_read32(gmu, 0x14600));
++        IOLog("NativeAdrenoGmu: DIAG gdscr gx=0x%08x cx=0x%08x rpmh_ctrl=0x%08x vote gx=0x%08x mx=0x%08x\n",
++              io_read32(cc, GPU_GX_GDSCR), io_read32(cc, GPU_CX_GDSCR), io_read32(gmu, 0x143a0),
++              io_read32(gmu, 0x8fe4), io_read32(gmu, 0x8fe8));
++        for (unsigned g = 0; g < 12; g += 4) {
++            IOLog("NativeAdrenoGmu: DIAG general[%u..%u]=%08x %08x %08x %08x\n", g, g + 3,
++                  io_read32(gmu, 0x14714 + 4 * g), io_read32(gmu, 0x14714 + 4 * (g + 1)),
++                  io_read32(gmu, 0x14714 + 4 * (g + 2)), io_read32(gmu, 0x14714 + 4 * (g + 3)));
++        }
++        if (sweet_log_sync) sweet_log_sync();
 +        return kIOReturnTimeout;
 +    }
 +
