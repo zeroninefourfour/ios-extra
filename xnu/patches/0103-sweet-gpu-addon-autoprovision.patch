@@ -1,0 +1,480 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..8957777 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6870,6 +6870,276 @@ static const char * init_programs[] = {
+  * 3		2		NA		/usr/appleinternal/sbin/launchd.development
+  * 4		3		1		/sbin/launchd
+  */
++extern volatile int native_bindfs_boot_mount;
++volatile int native_gpu_addon_stage = 0;
++volatile int native_gpu_addon_status = -1;
++volatile int native_gpu_addon2_stage = 0;
++volatile int native_gpu_addon2_status = -1;
++
++struct ustar_hdr {
++	char name[100];
++	char mode[8];
++	char uid[8];
++	char gid[8];
++	char size[12];
++	char mtime[12];
++	char chksum[8];
++	char typeflag;
++	char linkname[100];
++	char magic[6];
++	char version[2];
++	char uname[32];
++	char gname[32];
++	char devmajor[8];
++	char devminor[8];
++	char prefix[155];
++};
++
++static uint64_t
++native_parse_octal(const char *p, size_t len)
++{
++	uint64_t val = 0;
++	while (len > 0 && (*p == ' ' || *p == '\0')) {
++		p++;
++		len--;
++	}
++	while (len > 0 && *p >= '0' && *p <= '7') {
++		val = (val << 3) | (*p - '0');
++		p++;
++		len--;
++	}
++	return val;
++}
++
++static int
++native_mkdir_one(proc_t p, user_addr_t scratch, const char *path, int mode)
++{
++	int error;
++	int32_t retval = 0;
++	size_t len = strlen(path) + 1;
++	if (len > 512) {
++		return ENAMETOOLONG;
++	}
++	if ((error = copyout(path, scratch, len))) {
++		return error;
++	}
++	struct mkdir_args uap = {
++		.path = scratch,
++		.mode = mode
++	};
++	extern int mkdir(proc_t p, struct mkdir_args *uap, int32_t *retval);
++	error = mkdir(p, &uap, &retval);
++	if (error == EEXIST) {
++		error = 0;
++	}
++	return error;
++}
++
++static int
++native_mkdir_p(proc_t p, user_addr_t scratch, const char *path, int mode)
++{
++	char tmp[512];
++	size_t len = strlen(path);
++	if (len >= sizeof(tmp)) {
++		return ENAMETOOLONG;
++	}
++	strlcpy(tmp, path, sizeof(tmp));
++
++	for (char *slash = tmp + 1; *slash; slash++) {
++		if (*slash == '/') {
++			*slash = '\0';
++			native_mkdir_one(p, scratch, tmp, mode);
++			*slash = '/';
++		}
++	}
++	return native_mkdir_one(p, scratch, tmp, mode);
++}
++
++static int
++native_write_file(proc_t p, const char *path, const void *data, size_t size, int mode, int uid, int gid)
++{
++	vnode_t vp = NULLVP;
++	vfs_context_t ctx = vfs_context_kernel();
++	int error = vnode_open(path, (O_CREAT | O_TRUNC | FWRITE), mode, 0, &vp, ctx);
++	if (error) {
++		printf("SWEET: native_write_file: vnode_open failed for %s: %d\n", path, error);
++		return error;
++	}
++	if (size > 0 && data != NULL) {
++		int resid = 0;
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)data, (int)size, 0, UIO_SYSSPACE, IO_SYNC, kauth_cred_get(), &resid, p);
++		if (error) {
++			printf("SWEET: native_write_file: vn_rdwr failed for %s: %d\n", path, error);
++		}
++	}
++	if (uid != 0 || gid != 0) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_uid, uid);
++		VATTR_SET(&va, va_gid, gid);
++		(void)vnode_setattr(vp, &va, ctx);
++	}
++	vnode_close(vp, FWRITE, ctx);
++	return error;
++}
++
++static void
++native_gpu_addon_extract_if_needed(proc_t p, user_addr_t scratch)
++{
++	vnode_t probe = NULLVP;
++	int error = vnode_lookup("/private/var/ngpu/addons/NativeAdrenoMetal.bundle/NativeAdrenoMetal", 0, &probe, vfs_context_current());
++	if (!error) {
++		vnode_put(probe);
++		printf("SWEET: native_gpu_addon: already present on disk, skipping auto-provision\n");
++		return;
++	}
++
++	printf("SWEET: native_gpu_addon: /private/var/ngpu not found, checking memory RAMDisk for payload...\n");
++	extern int mdevgetrange(int devid, uint64_t *base, uint64_t *size);
++	uint64_t ram_base = 0, ram_size = 0;
++	if (mdevgetrange(0, &ram_base, &ram_size) != 0 || ram_base == 0 || ram_size < 512) {
++		printf("SWEET: native_gpu_addon: RAMDisk not available (base=0x%llx, size=%llu)\n", ram_base, ram_size);
++		return;
++	}
++
++	const uint8_t *tar_ptr = (const uint8_t *)ram_base;
++	uint64_t offset = 0;
++	int file_count = 0;
++	uint64_t total_bytes = 0;
++
++	printf("SWEET: native_gpu_addon: unpacking tar from RAM at 0x%llx (%llu bytes)...\n", ram_base, ram_size);
++
++	while (offset + 512 <= ram_size) {
++		const struct ustar_hdr *hdr = (const struct ustar_hdr *)(tar_ptr + offset);
++		if (hdr->name[0] == '\0') {
++			break;
++		}
++
++		char target_path[512] = {};
++		if (hdr->prefix[0] != '\0') {
++			snprintf(target_path, sizeof(target_path), "/private/var/%.155s/%.100s", hdr->prefix, hdr->name);
++		} else if (strncmp(hdr->name, "./", 2) == 0) {
++			snprintf(target_path, sizeof(target_path), "/private/var/%s", hdr->name + 2);
++		} else if (hdr->name[0] == '/') {
++			snprintf(target_path, sizeof(target_path), "%s", hdr->name);
++		} else {
++			snprintf(target_path, sizeof(target_path), "/private/var/%s", hdr->name);
++		}
++
++		size_t plen = strlen(target_path);
++		if (plen > 1 && target_path[plen - 1] == '/') {
++			target_path[plen - 1] = '\0';
++		}
++
++		uint64_t file_size = native_parse_octal(hdr->size, sizeof(hdr->size));
++		int mode = (int)native_parse_octal(hdr->mode, sizeof(hdr->mode));
++		int uid = (int)native_parse_octal(hdr->uid, sizeof(hdr->uid));
++		int gid = (int)native_parse_octal(hdr->gid, sizeof(hdr->gid));
++		char type = hdr->typeflag;
++
++		offset += 512;
++
++		if (type == '5' || (type == '\0' && hdr->name[strlen(hdr->name) - 1] == '/')) {
++			native_mkdir_p(p, scratch, target_path, mode ? mode : 0755);
++		} else if (type == '0' || type == '\0') {
++			char parent_buf[512];
++			strlcpy(parent_buf, target_path, sizeof(parent_buf));
++			char *last_slash = strrchr(parent_buf, '/');
++			if (last_slash && last_slash != parent_buf) {
++				*last_slash = '\0';
++				native_mkdir_p(p, scratch, parent_buf, 0755);
++			}
++
++			if (offset + file_size <= ram_size) {
++				const void *file_data = (const void *)(tar_ptr + offset);
++				native_write_file(p, target_path, file_data, (size_t)file_size, mode ? mode : 0644, uid, gid);
++				file_count++;
++				total_bytes += file_size;
++			}
++			offset += (file_size + 511) & ~511ULL;
++		} else {
++			offset += (file_size + 511) & ~511ULL;
++		}
++	}
++
++	printf("SWEET: native_gpu_addon: successfully auto-extracted %d files (%llu bytes) to /private/var!\n",
++	    file_count, total_bytes);
++}
++
++static void
++native_gpu_addon_mount(proc_t p, user_addr_t scratch, user_addr_t offset, const char *source, size_t source_size,
++    const char *point, size_t point_size, const char *visible, const char *own, volatile int *stage, volatile int *status)
++{
++	vnode_t probe = NULLVP;
++	int error;
++	*stage = 1;
++	error = vnode_lookup(source, 0, &probe, vfs_context_current());
++	if (error) {
++		*status = error;
++		return;
++	}
++	vnode_put(probe);
++	probe = NULLVP;
++	*stage = 2;
++	struct mount_args request = {.type = scratch + offset, .path = scratch + offset + 0x20,
++	    .flags = MNT_RDONLY | MNT_UNION, .data = scratch + offset + 0x100};
++	int32_t result = 0;
++	if ((error = copyout("bindfs", request.type, 7)) || (error = copyout(point, request.path, point_size)) ||
++	    (error = copyout(source, request.data, source_size))) {
++		*status = error;
++		return;
++	}
++	native_bindfs_boot_mount = 1;
++	extern int mount(proc_t p, struct mount_args *uap, int32_t *retval);
++	error = mount(p, &request, &result);
++	native_bindfs_boot_mount = 0;
++	if (error) {
++		*status = error;
++		return;
++	}
++	*stage = 3;
++	/* The union must still show a lower entry next to the owner's. */
++	error = vnode_lookup(visible, 0, &probe, vfs_context_current());
++	if (!error) {
++		vnode_put(probe);
++		probe = NULLVP;
++		*stage = 4;
++		/* ... and the owner's own entry must be visible through it (stage 5). */
++		error = vnode_lookup(own, 0, &probe, vfs_context_current());
++		if (!error) {
++			vnode_put(probe);
++			probe = NULLVP;
++			*stage = 5;
++		}
++	}
++	*status = error;
++}
++
++static void
++native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
++{
++	uint32_t enabled = 0;
++	if ((!PE_parse_boot_argn("sheng-gpu-addon", &enabled, sizeof(enabled)) || enabled != 1) &&
++	    (!PE_parse_boot_argn("sweet-gpu-addon", &enabled, sizeof(enabled)) || enabled != 1)) {
++		return;
++	}
++	printf("SWEET: native_gpu_addon_prepare: starting GPU addon auto-provision and union mount...\n");
++
++	native_gpu_addon_extract_if_needed(p, scratch);
++
++	static const char extensions_source[] = "/private/var/ngpu/addons", extensions_point[] = "/System/Library/Extensions";
++	static const char daemons_source[] = "/private/var/ngpu/daemons", daemons_point[] = "/System/Library/LaunchDaemons";
++	native_gpu_addon_mount(p, scratch, 0x400, extensions_source, sizeof(extensions_source), extensions_point,
++	    sizeof(extensions_point), "/System/Library/Extensions",
++	    "/System/Library/Extensions/NativeAdrenoMetal.bundle/Info.plist", &native_gpu_addon_stage,
++	    &native_gpu_addon_status);
++	native_gpu_addon_mount(p, scratch, 0x600, daemons_source, sizeof(daemons_source), daemons_point, sizeof(daemons_point),
++	    "/System/Library/LaunchDaemons/com.apple.backboardd.plist",
++	    "/System/Library/LaunchDaemons/org.blu-sharky.adrenoprobed.plist", &native_gpu_addon2_stage, &native_gpu_addon2_status);
++	printf("SWEET: native_gpu_addon_prepare: extensions stage=%d status=%d, daemons stage=%d status=%d\n",
++	    native_gpu_addon_stage, native_gpu_addon_status, native_gpu_addon2_stage, native_gpu_addon2_status);
++}
++
+ void
+ load_init_program(proc_t p)
+ {
+@@ -6884,6 +7154,8 @@ load_init_program(proc_t p)
+ 	(void) memorystatus_init_at_boot_snapshot();
+ #endif /* CONFIG_MEMORYSTATUS */
+ 
++	native_gpu_addon_prepare(p, (user_addr_t)scratch_addr);
++
+ #if DEBUG || DEVELOPMENT
+ 	/* Check for boot-arg suffix first */
+ 	char launchd_suffix[64];
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4d..e728083 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -264,7 +264,8 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+ {
+ 	mount_t mp = vnode_mount(vp);
+ 	*cs_flags |= CS_SIGNED;
+-	if (mp != NULL && (vfs_flags(mp) & MNT_ROOTFS)) {
++	if (mp != NULL && ((vfs_flags(mp) & MNT_ROOTFS) ||
++	    (vfs_statfs(mp) && strcmp(vfs_statfs(mp)->f_fstypename, "bindfs") == 0))) {
+ 		*cs_flags |= CS_PLATFORM_BINARY;
+ 	}
+ 	if (cs_blob != cs_blob->csb_ro_addr && cs_blob->csb_entitlements == NULL) {
+diff --git a/bsd/miscfs/bindfs/bind_vfsops.c b/bsd/miscfs/bindfs/bind_vfsops.c
+index 412f9ec..4466a64 100644
+--- a/bsd/miscfs/bindfs/bind_vfsops.c
++++ b/bsd/miscfs/bindfs/bind_vfsops.c
+@@ -78,6 +78,8 @@
+ 
+ #include "bindfs.h"
+ 
++volatile int native_bindfs_boot_mount = 0;
++
+ #define BINDFS_ENTITLEMENT "com.apple.private.bindfs-allow"
+ 
+ #define SIZEOF_MEMBER(type, member) (sizeof(((type *)0)->member))
+@@ -139,8 +141,9 @@ bindfs_mount(struct mount * mp, __unused vnode_t devvp, user_addr_t user_data, v
+ 		return ENOTSUP;
+ 	}
+ 
+-	/* check entitlement */
+-	if (!IOCurrentTaskHasEntitlement(BINDFS_ENTITLEMENT)) {
++	/* check entitlement; the boot-time addon mount (kern_exec.c native_gpu_addon_prepare) runs before any
++	 * entitled process exists and sets this flag around its own mount() call only */
++	if (!native_bindfs_boot_mount && !IOCurrentTaskHasEntitlement(BINDFS_ENTITLEMENT)) {
+ 		return EPERM;
+ 	}
+ 
+@@ -230,6 +233,9 @@ bindfs_mount(struct mount * mp, __unused vnode_t devvp, user_addr_t user_data, v
+ 	sp->f_flags = flags;
+ 
+ 	xmp->bindm_flags = BINDM_CASEINSENSITIVE; /* default to case insensitive */
++	if (native_bindfs_boot_mount) {
++		xmp->bindm_flags |= BINDM_FORCE_ROOT;
++	}
+ 
+ 	error = bindfs_vfs_getlowerattr(vnode_mount(lowerrootvp), &vfa, ctx);
+ 	if (error == 0) {
+diff --git a/bsd/miscfs/bindfs/bind_vnops.c b/bsd/miscfs/bindfs/bind_vnops.c
+index fc84a75..1e17e51 100644
+--- a/bsd/miscfs/bindfs/bind_vnops.c
++++ b/bsd/miscfs/bindfs/bind_vnops.c
+@@ -105,6 +105,14 @@ bindfs_getattr(struct vnop_getattr_args * args)
+ 		vnode_put(lowervp);
+ 
+ 		if (error == 0) {
++			if (MOUNTTOBINDMOUNT(vnode_mount(args->a_vp))->bindm_flags & BINDM_FORCE_ROOT) {
++				if (VATTR_IS_ACTIVE(args->a_vap, va_uid)) {
++					VATTR_RETURN(args->a_vap, va_uid, 0);
++				}
++				if (VATTR_IS_ACTIVE(args->a_vap, va_gid)) {
++					VATTR_RETURN(args->a_vap, va_gid, 0);
++				}
++			}
+ 			if (VATTR_IS_ACTIVE(args->a_vap, va_fsid)) {
+ 				/* fix up fsid so it doesn't say the underlying fs*/
+ 				VATTR_RETURN(args->a_vap, va_fsid, vfs_statfs(vnode_mount(args->a_vp))->f_fsid.val[0]);
+diff --git a/bsd/miscfs/bindfs/bindfs.h b/bsd/miscfs/bindfs/bindfs.h
+index c3bebc8..4555530 100644
+--- a/bsd/miscfs/bindfs/bindfs.h
++++ b/bsd/miscfs/bindfs/bindfs.h
+@@ -81,6 +81,9 @@
+ //#define BINDFS_DEBUG 0
+ 
+ #define BINDM_CACHE 0x0001
++/* Owner boot overlay (native_bindfs_boot_mount): report every file as owned by root:wheel. The backing directory is owner data made
++ * without root; launchd and the loader expect system-directory content to be root owned. Mode bits are left as they are. */
++#define BINDM_FORCE_ROOT 0x80000000ULL
+ #define BINDM_CASEINSENSITIVE 0x0000000000000002
+ 
+ typedef int (*vop_t)(void *);
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index 163fce1..6c6c011 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4333,6 +4333,55 @@ is_io_service_set_authorization_id(
+ }
+ 
+ /* Routine io_service_open_ndr */
++/*
++ * The native GPU driver names, by the property NativeSandboxGrantProcess on its accelerator service, the processes
++ * to which it grants its own user client in place of the sandbox's verdict: the original profiles name no class of that driver.
++ * Supports comma-separated process names, wildcard '*', and the boolean property NativeSandboxGrant.
++ */
++extern "C" void proc_selfname(char * buf, int size);
++static bool
++native_sandbox_grant(IOService * service)
++{
++	if (!service) {
++		return false;
++	}
++	if (service->getProperty("NativeSandboxGrant") == kOSBooleanTrue) {
++		return true;
++	}
++	OSString * process = OSDynamicCast(OSString, service->getProperty("NativeSandboxGrantProcess"));
++	if (!process) {
++		return false;
++	}
++	const char *list = process->getCStringNoCopy();
++	if (!list || !list[0]) {
++		return false;
++	}
++	if (strcmp(list, "*") == 0) {
++		return true;
++	}
++	char name[32] = {};
++	proc_selfname(name, sizeof(name));
++	if (!name[0]) {
++		return false;
++	}
++	size_t namelen = strlen(name);
++	const char *p = list;
++	while (*p) {
++		while (*p == ',' || *p == ' ') p++;
++		if (!*p) break;
++		const char *end = strchr(p, ',');
++		size_t tokenlen = end ? (size_t)(end - p) : strlen(p);
++		while (tokenlen > 0 && p[tokenlen - 1] == ' ') tokenlen--;
++		if ((tokenlen == 1 && *p == '*') ||
++		    (tokenlen == namelen && strncmp(p, name, namelen) == 0)) {
++			return true;
++		}
++		if (!end) break;
++		p = end + 1;
++	}
++	return false;
++}
++
+ kern_return_t
+ is_io_service_open_extended(
+ 	io_object_t _service,
+@@ -4361,7 +4410,7 @@ is_io_service_open_extended(
+ 	}
+ 
+ #if CONFIG_MACF
+-	if (mac_iokit_check_open_service(kauth_cred_get(), service, connect_type) != 0) {
++	if (!native_sandbox_grant(service) && mac_iokit_check_open_service(kauth_cred_get(), service, connect_type) != 0) {
+ 		return kIOReturnNotPermitted;
+ 	}
+ #endif
+@@ -4529,7 +4578,9 @@ is_io_service_open_extended(
+ 				res = kIOReturnNotPrivileged;
+ 			}
+ #if CONFIG_MACF
+-			else if (0 != mac_iokit_check_open(kauth_cred_get(), client, connect_type)) {
++			/* The service's grant (native_sandbox_grant) stands in for the sandbox's verdict on permitted processes' open. */
++			else if (!native_sandbox_grant(service)
++			    && 0 != mac_iokit_check_open(kauth_cred_get(), client, connect_type)) {
+ 				IOLog("IOUC %s failed MACF in process %s\n",
+ 				    client->getMetaClass()->getClassName(), creatorNameCStr);
+ 				res = kIOReturnNotPermitted;
+@@ -4537,6 +4588,7 @@ is_io_service_open_extended(
+ #endif
+ 
+ 			if ((kIOReturnSuccess == res)
++			    && !native_sandbox_grant(service)
+ 			    && gIOUCFilterCallbacks
+ 			    && gIOUCFilterCallbacks->io_filter_resolver) {
+ 				io_filter_policy_t filterPolicy;
+diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+index bec97fb..325bb91 100644
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -468,10 +468,11 @@ kernel_bootstrap(void)
+ 		if (PE_parse_boot_argn("-show_pointers", &namep, sizeof(namep))) {
+ 			doprnt_hide_pointers = FALSE;
+ 		}
+-		if (PE_parse_boot_argn("-no_slto_panic", &namep, sizeof(namep))) {
+-			extern boolean_t spinlock_timeout_panic;
+-			spinlock_timeout_panic = FALSE;
+-		}
++	}
++	/* Owner device: honour -no_slto_panic without a debugger-enabled device policy */
++	if (PE_parse_boot_argn("-no_slto_panic", &namep, sizeof(namep))) {
++		extern boolean_t spinlock_timeout_panic;
++		spinlock_timeout_panic = FALSE;
+ 	}
+ 
+ 	kernel_bootstrap_log("console_init");
