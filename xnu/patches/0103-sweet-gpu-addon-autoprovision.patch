@@ -1,16 +1,47 @@
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 68612db..8957777 100644
+index 68612db..d9d333c 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -6870,6 +6870,276 @@ static const char * init_programs[] = {
+@@ -6870,6 +6870,345 @@ static const char * init_programs[] = {
   * 3		2		NA		/usr/appleinternal/sbin/launchd.development
   * 4		3		1		/sbin/launchd
   */
++#include <libkern/zlib.h>
++#include <vm/vm_kern.h>
++
 +extern volatile int native_bindfs_boot_mount;
 +volatile int native_gpu_addon_stage = 0;
 +volatile int native_gpu_addon_status = -1;
 +volatile int native_gpu_addon2_stage = 0;
 +volatile int native_gpu_addon2_status = -1;
++
++struct native_z_mem {
++	uint32_t alloc_size;
++	uint8_t  data[0];
++};
++
++static void *
++native_z_alloc(void *notused __unused, u_int num_items, u_int size)
++{
++	uint64_t total = (uint64_t)num_items * (uint64_t)size;
++	uint32_t allocSize = (uint32_t)(total + sizeof(struct native_z_mem));
++	struct native_z_mem *zmem = (struct native_z_mem *)kalloc_data(allocSize, Z_WAITOK | Z_ZERO);
++	if (!zmem) {
++		return NULL;
++	}
++	zmem->alloc_size = allocSize;
++	return zmem->data;
++}
++
++static void
++native_z_free(void *notused __unused, void *ptr)
++{
++	if (!ptr) {
++		return;
++	}
++	struct native_z_mem *zmem = (struct native_z_mem *)((uintptr_t)ptr - sizeof(struct native_z_mem));
++	kfree_data(zmem, zmem->alloc_size);
++}
 +
 +struct ustar_hdr {
 +	char name[100];
@@ -139,6 +170,40 @@ index 68612db..8957777 100644
 +	}
 +
 +	const uint8_t *tar_ptr = (const uint8_t *)ram_base;
++	vm_offset_t decomp_buf = 0;
++	vm_size_t decomp_max = 64 * 1024 * 1024;
++
++	if (ram_size >= 2 && tar_ptr[0] == 0x1f && tar_ptr[1] == 0x8b) {
++		printf("SWEET: native_gpu_addon: detected gzip payload (%llu bytes), decompressing...\n", ram_size);
++		if (kmem_alloc(kernel_map, &decomp_buf, decomp_max, KMA_DATA, VM_KERN_MEMORY_NONE) == KERN_SUCCESS) {
++			z_stream zs;
++			bzero(&zs, sizeof(zs));
++			zs.next_in = (Bytef *)tar_ptr;
++			zs.avail_in = (uInt)ram_size;
++			zs.next_out = (Bytef *)decomp_buf;
++			zs.avail_out = (uInt)decomp_max;
++			zs.zalloc = native_z_alloc;
++			zs.zfree = native_z_free;
++
++			if (inflateInit2(&zs, 16 + MAX_WBITS) == Z_OK) {
++				int zerr = inflate(&zs, Z_FINISH);
++				inflateEnd(&zs);
++				if (zerr == Z_STREAM_END || zerr == Z_OK) {
++					printf("SWEET: native_gpu_addon: decompressed %u gzip bytes -> %lu tar bytes\n",
++					    (uInt)zs.total_in, (uLong)zs.total_out);
++					tar_ptr = (const uint8_t *)decomp_buf;
++					ram_size = zs.total_out;
++				} else {
++					printf("SWEET: native_gpu_addon: inflate failed: %d\n", zerr);
++				}
++			} else {
++				printf("SWEET: native_gpu_addon: inflateInit2 failed\n");
++			}
++		} else {
++			printf("SWEET: native_gpu_addon: kmem_alloc failed for %lu bytes\n", (uLong)decomp_max);
++		}
++	}
++
 +	uint64_t offset = 0;
 +	int file_count = 0;
 +	uint64_t total_bytes = 0;
@@ -196,6 +261,10 @@ index 68612db..8957777 100644
 +		} else {
 +			offset += (file_size + 511) & ~511ULL;
 +		}
++	}
++
++	if (decomp_buf) {
++		kmem_free(kernel_map, decomp_buf, decomp_max);
 +	}
 +
 +	printf("SWEET: native_gpu_addon: successfully auto-extracted %d files (%llu bytes) to /private/var!\n",
@@ -279,7 +348,7 @@ index 68612db..8957777 100644
  void
  load_init_program(proc_t p)
  {
-@@ -6884,6 +7154,8 @@ load_init_program(proc_t p)
+@@ -6884,6 +7223,8 @@ load_init_program(proc_t p)
  	(void) memorystatus_init_at_boot_snapshot();
  #endif /* CONFIG_MEMORYSTATUS */
  
