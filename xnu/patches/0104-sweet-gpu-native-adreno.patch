@@ -8812,10 +8812,10 @@ index 0000000..617afd2
 +}
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.h b/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.h
 new file mode 100644
-index 0000000..dbe915a
+index 0000000..5856de7
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.h
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,51 @@
 +/* SPDX-License-Identifier: MIT */
 +#ifndef NATIVE_ADRENO_GPU_CONTEXT_H
 +#define NATIVE_ADRENO_GPU_CONTEXT_H
@@ -8823,7 +8823,8 @@ index 0000000..dbe915a
 +
 +/* The GPU's own SMMU context, built like the GMU's (NativeAdrenoGmuContext): a native4K lower-region (TTBR0) table
 + * pool for a 0..2 GiB GPU space, one context bank, the GPU's two streams routed to it, then the kernel buffers the
-+ * command processor needs at fixed GPU addresses below the A740 GMEM window (UCHE_GMEM_RANGE_MIN 16 MiB):
++ * command processor needs at fixed GPU addresses. Sweet (A618): the GMEM window is UCHE_GMEM_RANGE_MIN 1 MiB .. +512 KiB, so the SQE
++ * sits above it (at 1 MiB the CP fetched microcode from GMEM); ring/memptrs/scratch were already clear of it:
 + *   sqe      the SQE microcode (a740_sqe.fw without its first dword, as adreno_fw_create_bo copies it), R+X
 + *   ring     ring buffer 0, 32 KiB, aligned to its size, R+W
 + *   memptrs  msm_rbmemptrs layout: +0 rptr, +4 fence, +8 bv_rptr, +12 bv_fence, R+W
@@ -8832,7 +8833,7 @@ index 0000000..dbe915a
 + * All mappings are Normal non-cacheable (Linux maps kernel BOs write-combined) and outer shareable; the CPU must use
 + * a matching non-cacheable view. Bank, ASID, SMR slots and stream IDs are caller inputs. Nothing is torn down. */
 +enum : uint64_t {
-+    GpuSqeIova=0x100000, GpuRingIova=0x200000, GpuMemptrsIova=0x300000, GpuPwrupIova=0x301000,
++    GpuSqeIova=0x400000, GpuRingIova=0x200000, GpuMemptrsIova=0x300000, GpuPwrupIova=0x301000,
 +    GpuScratchIova=0x302000, GpuApertureBytes=0x80000000
 +};
 +enum : size_t {GpuSqeBytes=0x13000, GpuRingBytes=0x8000, GpuPageBytes=0x1000, GpuBufferCount=5};
@@ -10815,10 +10816,10 @@ index 0000000..55c6a93
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..ce92595
+index 0000000..dbce0be
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,693 @@
+@@ -0,0 +1,708 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -11263,9 +11264,10 @@ index 0000000..ce92595
 +    svc_step("load-sqe");
 +    /* Load SQE microcode */
 +    if (reinterpret_cast<uintptr_t>(native_adreno_sqe_firmware_image) && native_adreno_sqe_firmware_image_size) {
-+        const size_t copy_bytes = static_cast<size_t>(native_adreno_sqe_firmware_image_size);
++        /* adreno_fw_create_bo copies fw->data + 4: the first dword is the firmware version, not an instruction. */
++        const size_t copy_bytes = static_cast<size_t>(native_adreno_sqe_firmware_image_size) - 4;
 +        memcpy(const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(0)).mapping(),
-+               native_adreno_sqe_firmware_image, copy_bytes);
++               native_adreno_sqe_firmware_image + 4, copy_bytes);
 +        const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(0)).publishForDevice(0, GpuSqeBytes, false);
 +        IOLog("NativeAdreno: SQE microcode published (%lu bytes at IOVA 0x%llx)\n",
 +            static_cast<unsigned long>(copy_bytes), static_cast<unsigned long long>(GpuSqeIova));
@@ -11302,14 +11304,16 @@ index 0000000..ce92595
 +        gpu_write32(&gpu_window, NativeAdrenoA618Hwcg[i][0], NativeAdrenoA618Hwcg[i][1]);
 +    }
 +    gpu_write32(&gpu_window, A618_RBBM_CLOCK_CNTL, 0);
++    gpu_write32(&gpu_window, A618_RBBM_VBIF_CLIENT_QOS_CNTL, 0x3);
 +
 +    /* 4. Configure UCHE */
-+    gpu_write32(&gpu_window, A618_UCHE_WRITE_RANGE_MAX, static_cast<uint32_t>(0x100000 + 0xfc0));
-+    gpu_write32(&gpu_window, A618_UCHE_WRITE_RANGE_MAX + 1, 0);
-+    gpu_write32(&gpu_window, A618_UCHE_TRAP_BASE, 0x100000);
-+    gpu_write32(&gpu_window, A618_UCHE_TRAP_BASE + 1, 0);
-+    gpu_write32(&gpu_window, A618_UCHE_WRITE_THRU_BASE, 0x100000);
-+    gpu_write32(&gpu_window, A618_UCHE_WRITE_THRU_BASE + 1, 0);
++    /* a6xx hw_init: L2 bypass disabled, trap/write-through at the top of the VA space (not at the GMEM window). */
++    gpu_write32(&gpu_window, A618_UCHE_WRITE_RANGE_MAX, 0xffffffc0u);
++    gpu_write32(&gpu_window, A618_UCHE_WRITE_RANGE_MAX + 1, 0x0001ffffu);
++    gpu_write32(&gpu_window, A618_UCHE_TRAP_BASE, 0xfffff000u);
++    gpu_write32(&gpu_window, A618_UCHE_TRAP_BASE + 1, 0x0001ffffu);
++    gpu_write32(&gpu_window, A618_UCHE_WRITE_THRU_BASE, 0xfffff000u);
++    gpu_write32(&gpu_window, A618_UCHE_WRITE_THRU_BASE + 1, 0x0001ffffu);
 +    gpu_write32(&gpu_window, A618_UCHE_GMEM_RANGE_MIN, 0x100000);
 +    gpu_write32(&gpu_window, A618_UCHE_GMEM_RANGE_MIN + 1, 0);
 +    gpu_write32(&gpu_window, A618_UCHE_GMEM_RANGE_MAX, static_cast<uint32_t>(0x100000 + A618_GMEM_SIZE - 1));
@@ -11341,7 +11345,7 @@ index 0000000..ce92595
 +    gpu_write32(&gpu_window, A618_CP_SQE_INSTR_BASE + 1, static_cast<uint32_t>(GpuSqeIova >> 32));
 +    gpu_write32(&gpu_window, A618_CP_RB_BASE, static_cast<uint32_t>(GpuRingIova));
 +    gpu_write32(&gpu_window, A618_CP_RB_BASE + 1, static_cast<uint32_t>(GpuRingIova >> 32));
-+    gpu_write32(&gpu_window, A618_CP_RB_CNTL, (1u << 11) | 13u); /* 32 KiB ring, BLKSZ 8 */
++    gpu_write32(&gpu_window, A618_CP_RB_CNTL, (2u << 8) | 12u); /* MSM_GPU_RB_CNTL_DEFAULT: 32 KiB ring (BUFSZ 12), BLKSZ 2 */
 +    gpu_write32(&gpu_window, A618_CP_RB_RPTR_ADDR, static_cast<uint32_t>(GpuMemptrsIova));
 +    gpu_write32(&gpu_window, A618_CP_RB_RPTR_ADDR + 1, static_cast<uint32_t>(GpuMemptrsIova >> 32));
 +    gpu_write32(&gpu_window, A618_CP_RB_RPTR, 0);
@@ -11388,6 +11392,18 @@ index 0000000..ce92595
 +    NativeAdrenoRingClock clock{ nullptr, ring_now, nullptr };
 +    if (ring_.wait(init_fence, &clock, 2000, nullptr) != NativeAdrenoRingFenceComplete) {
 +        IOLog("NativeAdreno: A6xx CP_ME_INIT fence %u timed out\n", init_fence);
++        {
++            auto g = [&](uint32_t reg) { uint32_t v = 0xdeadbeef; (void)gpu_read32(&gpu_window, reg, &v); return (unsigned)v; };
++            auto sm = [&](size_t at) { uint32_t v = 0xdeadbeef; (void)smmu_read32(&smmu_win, at, &v); return (unsigned)v; };
++            const volatile uint32_t *mp = reinterpret_cast<const volatile uint32_t *>(
++                const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(2)).mapping());
++            IOLog("NativeAdreno: DIAG cp rb_rptr 0x%x rb_wptr 0x%x sqe_cntl 0x%x rbbm_status 0x%x status3 0x%x int0 0x%x hw_fault 0x%x cp_int 0x%x memptr rptr 0x%x fence 0x%x\n",
++                g(A618_CP_RB_RPTR), g(A618_CP_RB_WPTR), g(A618_CP_SQE_CNTL), g(A618_RBBM_STATUS), g(A618_RBBM_STATUS3),
++                g(A618_RBBM_INT_0_STATUS), g(A618_CP_HW_FAULT), g(A618_CP_INTERRUPT_STATUS), (unsigned)mp[0], (unsigned)mp[1]);
++            IOLog("NativeAdreno: DIAG smmu sGFSR 0x%x sGFSYNR0 0x%x cb0 sctlr 0x%x fsr 0x%x fsynr0 0x%x far 0x%x ttbr0 0x%x cbar0 0x%x\n",
++                sm(0x48), sm(0x50), sm(0x8000), sm(0x8058), sm(0x8068), sm(0x8060), sm(0x8020), sm(0x1000));
++            if (sweet_log_sync) sweet_log_sync();
++        }
 +        smmu_svc->release();
 +        gmu_svc->release();
 +        teardown();
