@@ -10831,10 +10831,10 @@ index 0000000..55c6a93
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..df68855
+index 0000000..fab5b28
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,716 @@
+@@ -0,0 +1,734 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -11408,7 +11408,8 @@ index 0000000..df68855
 +    }
 +    svc_step("cp-me-init-submitted");
 +    NativeAdrenoRingClock clock{ nullptr, ring_now, nullptr };
-+    if (ring_.wait(init_fence, &clock, 2000, nullptr) != NativeAdrenoRingFenceComplete) {
++    /* 200 ms: the first CACHE_FLUSH_TS after power-up may take longer than the old 2 ms. */
++    if (ring_.wait(init_fence, &clock, 200000, nullptr) != NativeAdrenoRingFenceComplete) {
 +        IOLog("NativeAdreno: A6xx CP_ME_INIT fence %u timed out\n", init_fence);
 +        if (sweet_log_sync) sweet_log_sync();
 +        {
@@ -11425,6 +11426,23 @@ index 0000000..df68855
 +                g(A618_RBBM_INT_0_STATUS), g(A618_CP_HW_FAULT), g(A618_CP_INTERRUPT_STATUS), (unsigned)mp[0], (unsigned)mp[1]);
 +            IOLog("NativeAdreno: DIAG smmu sGFSR 0x%x sGFSYNR0 0x%x cb0 sctlr 0x%x fsr 0x%x fsynr0 0x%x far 0x%x:%x ttbr0 0x%x cbar0 0x%x\n",
 +                sm(0x48), sm(0x50), sm(0x8000), sm(0x8058), sm(0x8068), sm(0x8064), sm(0x8060), sm(0x8020), sm(0x1000));
++            /* CP_SCRATCH_REG(2) is written by the first packet of the fence submission (seqno 1);
++             * CP_STATUS_1 / CP_PROTECT_STATUS for CP state. */
++            IOLog("NativeAdreno: DIAG cp2 scratch2 0x%x status1 0x%x protect_status 0x%x\n", g(0x885), g(0x825), g(0x824));
++            {
++                const volatile uint32_t *rb = reinterpret_cast<const volatile uint32_t *>(
++                    const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(1)).mapping());
++                IOLog("NativeAdreno: DIAG ring[0..15] %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
++                    (unsigned)rb[0], (unsigned)rb[1], (unsigned)rb[2], (unsigned)rb[3], (unsigned)rb[4], (unsigned)rb[5],
++                    (unsigned)rb[6], (unsigned)rb[7], (unsigned)rb[8], (unsigned)rb[9], (unsigned)rb[10], (unsigned)rb[11],
++                    (unsigned)rb[12], (unsigned)rb[13], (unsigned)rb[14], (unsigned)rb[15]);
++            }
++            if (sweet_log_sync) sweet_log_sync();
++            /* Look again after 100 ms: separates a slow GPU write from one that never lands. */
++            IOSleep(100);
++            (void)const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(2)).acquireDeviceWrites(0, 64);
++            IOLog("NativeAdreno: DIAG late memptr rptr 0x%x fence 0x%x rbbm_status 0x%x scratch2 0x%x\n",
++                (unsigned)mp[0], (unsigned)mp[1], g(A618_RBBM_STATUS), g(0x885));
 +            if (sweet_log_sync) sweet_log_sync();
 +        }
 +        smmu_svc->release();
