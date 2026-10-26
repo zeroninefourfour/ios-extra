@@ -15,6 +15,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      use_ccache:
+        description: compile through ccache (set false for a from-scratch build if a cached object is suspected)
+        default: "true"
   push:
     branches: [main]
     paths:
@@ -31,6 +34,15 @@ env:
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  # xnu's makefiles take CCACHE=ccache natively (KCC = $(CCACHE) $(CC)). Preprocessor mode
+  # (no direct mode) hashes the preprocessed source, so the fresh checkout's mtimes cannot
+  # cause a stale hit; the compiler is hashed by content, not by mtime.
+  USE_CCACHE: ${{ inputs.use_ccache == 'false' && 'false' || 'true' }}
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_NODIRECT: "1"
+  CCACHE_COMPILERCHECK: content
+  CCACHE_MAXSIZE: 1G
 
 jobs:
   build:
@@ -57,7 +69,7 @@ jobs:
 
       - name: Deps
         run: |
-          brew install jq gum bash cmake ninja
+          brew install jq gum bash cmake ninja ccache
           # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
           printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
           sudo chmod +x /usr/local/bin/xcodes
@@ -69,12 +81,42 @@ jobs:
           xcodebuild -version
           xcrun --find iig
 
+      - name: Restore ccache
+        id: ccache
+        if: ${{ env.USE_CCACHE == 'true' }}
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-${{ env.MACOS_VERSION }}-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.MACOS_VERSION }}-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-
+
       - name: Build
         working-directory: dxb
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          if [ "$USE_CCACHE" = true ]; then
+            export CCACHE="$(command -v ccache)"
+            ccache --version | head -1
+            ccache --zero-stats
+          fi
+          bash build.sh
+
+      - name: ccache statistics
+        if: ${{ always() && env.USE_CCACHE == 'true' }}
+        run: |
+          ccache --show-stats
+          { echo '### ccache'; echo '```'; ccache --show-stats; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      # A separate save step so a failed or partial build still keeps what it compiled.
+      - name: Save ccache
+        if: ${{ always() && env.USE_CCACHE == 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-${{ env.MACOS_VERSION }}-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-${{ github.run_id }}
 
       - name: Package build tree for local compiles
         if: always()
