@@ -10418,10 +10418,10 @@ index 0000000..570f464
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
 new file mode 100644
-index 0000000..1711ea1
+index 0000000..36abe49
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,288 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "NativeAdrenoRing.h"
 +#include "AdrenoPM4.h"
@@ -10442,6 +10442,7 @@ index 0000000..1711ea1
 +    RingScratch = 0x0885,     /* CP_SCRATCH(2) for A6XX..A7XX */
 +    RingFenceOpcode = 0x46,   /* CP_EVENT_WRITE7 on A7XX */
 +    RingFenceEvent = 0x31,    /* CACHE_CLEAN */
++    RingA6xxFenceEvent = 4,   /* CACHE_FLUSH_TS on A6XX */
 +    RingFenceEnable = 1u << 27,
 +    RingFenceIrq = 1u << 31,
 +    RingBlockBytes = 32,
@@ -10552,7 +10553,9 @@ index 0000000..1711ea1
 +    if(AdrenoPM4Type4(RingScratch,1,&words[0])!=AdrenoPM4Success ||
 +        AdrenoPM4Type7(RingFenceOpcode,4,&words[2])!=AdrenoPM4Success)return poison();
 +    words[1]=seqno;
-+    words[3]=RingFenceEvent|RingFenceEnable|RingFenceIrq;
++    /* Sweet (A618): a6xx_submit's fence is CP_EVENT_WRITE CACHE_FLUSH_TS (4) | IRQ. The A7XX encoding above is event 0x31, which on A6XX is
++     * CACHE_INVALIDATE (no timestamp write), and its WRITE_ENABLED bit means nothing there: CP_ME_INIT retired (rptr == wptr) but the fence stayed 0. */
++    words[3]=RingA6xxFenceEvent|RingFenceIrq;
 +    /* The timestamp goes to +4 (msm_rbmemptrs.fence), where wait() reads it; +0 is the CP's RPTR shadow. */
 +    const uint64_t at4=fence_iova_+4;
 +    words[4]=(uint32_t)at4;words[5]=(uint32_t)(at4>>32);words[6]=seqno;
@@ -10816,10 +10819,10 @@ index 0000000..55c6a93
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..dbce0be
+index 0000000..036efdf
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,708 @@
+@@ -0,0 +1,710 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -11395,13 +11398,15 @@ index 0000000..dbce0be
 +        {
 +            auto g = [&](uint32_t reg) { uint32_t v = 0xdeadbeef; (void)gpu_read32(&gpu_window, reg, &v); return (unsigned)v; };
 +            auto sm = [&](size_t at) { uint32_t v = 0xdeadbeef; (void)smmu_read32(&smmu_win, at, &v); return (unsigned)v; };
++            /* The CP wrote memptrs behind the CPU's cache: invalidate before looking, like ring wait() does. */
++            (void)const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(2)).acquireDeviceWrites(0, 64);
 +            const volatile uint32_t *mp = reinterpret_cast<const volatile uint32_t *>(
 +                const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(2)).mapping());
 +            IOLog("NativeAdreno: DIAG cp rb_rptr 0x%x rb_wptr 0x%x sqe_cntl 0x%x rbbm_status 0x%x status3 0x%x int0 0x%x hw_fault 0x%x cp_int 0x%x memptr rptr 0x%x fence 0x%x\n",
 +                g(A618_CP_RB_RPTR), g(A618_CP_RB_WPTR), g(A618_CP_SQE_CNTL), g(A618_RBBM_STATUS), g(A618_RBBM_STATUS3),
 +                g(A618_RBBM_INT_0_STATUS), g(A618_CP_HW_FAULT), g(A618_CP_INTERRUPT_STATUS), (unsigned)mp[0], (unsigned)mp[1]);
-+            IOLog("NativeAdreno: DIAG smmu sGFSR 0x%x sGFSYNR0 0x%x cb0 sctlr 0x%x fsr 0x%x fsynr0 0x%x far 0x%x ttbr0 0x%x cbar0 0x%x\n",
-+                sm(0x48), sm(0x50), sm(0x8000), sm(0x8058), sm(0x8068), sm(0x8060), sm(0x8020), sm(0x1000));
++            IOLog("NativeAdreno: DIAG smmu sGFSR 0x%x sGFSYNR0 0x%x cb0 sctlr 0x%x fsr 0x%x fsynr0 0x%x far 0x%x:%x ttbr0 0x%x cbar0 0x%x\n",
++                sm(0x48), sm(0x50), sm(0x8000), sm(0x8058), sm(0x8068), sm(0x8064), sm(0x8060), sm(0x8020), sm(0x1000));
 +            if (sweet_log_sync) sweet_log_sync();
 +        }
 +        smmu_svc->release();
