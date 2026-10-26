@@ -13893,3 +13893,60 @@ index acc9ae0..99f869d 100644
 +iokit/Kernel/arm/adreno/NativeAdrenoTimer.cpp                    optional iokitcpp
 +iokit/Kernel/arm/adreno/NativeAdrenoUserClient.cpp               optional iokitcpp
 +iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp                       optional iokitcpp
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 06bb568..71239d0 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -367,6 +367,24 @@ SECURITY_READ_ONLY_LATE(static ptov_table_entry)        ptov_table[PTOV_TABLE_SI
+ SECURITY_READ_ONLY_LATE(static boolean_t)               kva_active = FALSE;
+ 
+ 
++/* Sweet: the console crash log carries no backtrace, so an illegal-PA panic puts its caller chain in the panic string. */
++static void __attribute__((noinline))
++sweet_frames(uintptr_t out[8])
++{
++	uintptr_t *fp = (uintptr_t *)__builtin_frame_address(0);
++
++	for (int i = 0; i < 8; i++) {
++		out[i] = 0;
++	}
++	for (int i = 0; i < 8; i++) {
++		if (((uintptr_t)fp & 15) || (uintptr_t)fp < VM_MIN_KERNEL_ADDRESS) {
++			break;
++		}
++		out[i] = fp[1];
++		fp = (uintptr_t *)fp[0];
++	}
++}
++
+ vm_map_address_t
+ phystokv(pmap_paddr_t pa)
+ {
+@@ -377,8 +395,11 @@ phystokv(pmap_paddr_t pa)
+ 		}
+ 	}
+ 	if (__improbable((pa < gPhysBase) || ((pa - gPhysBase) >= real_phys_size))) {
+-		panic("%s: illegal PA: 0x%llx; phys base 0x%llx, size 0x%llx", __func__,
+-		    (unsigned long long)pa, (unsigned long long)gPhysBase, (unsigned long long)real_phys_size);
++		uintptr_t bt[8];
++		sweet_frames(bt);
++		panic("%s: illegal PA: 0x%llx; phys base 0x%llx, size 0x%llx bt %lx %lx %lx %lx %lx %lx %lx %lx", __func__,
++		    (unsigned long long)pa, (unsigned long long)gPhysBase, (unsigned long long)real_phys_size,
++		    bt[0], bt[1], bt[2], bt[3], bt[4], bt[5], bt[6], bt[7]);
+ 	}
+ 	return pa - gPhysBase + gVirtBase;
+ }
+@@ -402,8 +423,11 @@ phystokv_range(pmap_paddr_t pa, vm_size_t *max_len)
+ 		*max_len = len;
+ 	}
+ 	if (__improbable((pa < gPhysBase) || ((pa - gPhysBase) >= real_phys_size))) {
+-		panic("%s: illegal PA: 0x%llx; phys base 0x%llx, size 0x%llx", __func__,
+-		    (unsigned long long)pa, (unsigned long long)gPhysBase, (unsigned long long)real_phys_size);
++		uintptr_t bt[8];
++		sweet_frames(bt);
++		panic("%s: illegal PA: 0x%llx; phys base 0x%llx, size 0x%llx bt %lx %lx %lx %lx %lx %lx %lx %lx", __func__,
++		    (unsigned long long)pa, (unsigned long long)gPhysBase, (unsigned long long)real_phys_size,
++		    bt[0], bt[1], bt[2], bt[3], bt[4], bt[5], bt[6], bt[7]);
+ 	}
+ 	return pa - gPhysBase + gVirtBase;
+ }
