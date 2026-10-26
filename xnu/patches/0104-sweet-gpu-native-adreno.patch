@@ -1840,10 +1840,10 @@ index 0000000..25ccf6d
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/ArmSmmu4KStreams.c b/iokit/Kernel/arm/adreno/ArmSmmu4KStreams.c
 new file mode 100644
-index 0000000..4145ef2
+index 0000000..0fb111c
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/ArmSmmu4KStreams.c
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,158 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "ArmSmmu4KStreams.h"
 +#define FAULT (UINT32_C(2)<<16)
@@ -1865,7 +1865,8 @@ index 0000000..4145ef2
 +     * policy (USFCFG). Configuration-access fault reporting (GCFGFRE/GCFGFIE) is not required: Linux sets
 +     * it only in its own global reset, and firmware that owns sCR0 may leave it clear (an Adreno SMMU read
 +     * 0x002f0406). It reports bad register accesses, it does not change translation or bypass. */
-+    if((r->scr0&0x407)!=0x406 || !!(r->scr0&8)!=exids(r->id0))return ArmSmmu4KStateMismatch;
++    /* Sweet: GFIE (bit 2) is deliberately clear (the GMU service masks global fault interrupts), so only CLIENTPD/GFRE/USFCFG are required. */
++    if((r->scr0&0x403)!=0x402 || !!(r->scr0&8)!=exids(r->id0))return ArmSmmu4KStateMismatch;
 +    return r->global_fault?ArmSmmu4KFault:ArmSmmu4KSuccess;
 +}
 +static ArmSmmu4KStatus scan(const ArmSmmu4KIo *io,const ArmSmmu4KStream *s,unsigned n,
@@ -1886,7 +1887,7 @@ index 0000000..4145ef2
 +            unsigned live=valid(r->id0,smr,s2cr);
 +            if(attached) {
 +                if(smr!=(valid_smr(r->id0)|s[own].sid) || s2cr!=(bank|valid_s2cr(r->id0)))return ArmSmmu4KStateMismatch;
-+            } else if((s2cr&~valid_s2cr(r->id0))!=FAULT ||
++            } else if(((s2cr&~valid_s2cr(r->id0))&~UINT32_C(0xff))!=FAULT ||   /* Sweet: ABL leaves 0x000200ff (fault, CBNDX 0xff) */
 +                (live && smr!=(valid_smr(r->id0)|s[own].sid)))return ArmSmmu4KBusy;
 +            ++r->streams_verified;
 +        } else if(valid(r->id0,smr,s2cr)) {
@@ -9098,10 +9099,10 @@ index 0000000..af024fa
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoMemory.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoMemory.cpp
 new file mode 100644
-index 0000000..cec75a7
+index 0000000..570eb94
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoMemory.cpp
-@@ -0,0 +1,307 @@
+@@ -0,0 +1,321 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "NativeAdrenoMemory.h"
 +/* Where a call that never returns is stuck: the free/unmap/release path stores a stage number here, the board page shows it. */
@@ -9171,6 +9172,20 @@ index 0000000..cec75a7
 +    status=NativeAdrenoSetPagesCacheMode(&span,1,true);
 +    if(status)return status;
 +    pool.write_combined=true;return kIOReturnSuccess;
++}
++void NativeAdrenoMemory::releasePool()
++{
++    if(!pool.descriptor || pool.used)return;
++    if(pool.write_combined) {
++        const NativeAdrenoPhysicalSpan span={0,pool.physical,pool.bytes};
++        if(NativeAdrenoSetPagesCacheMode(&span,1,false)!=kIOReturnSuccess)return;   /* keep it rather than free pages with a stray attribute */
++        (void)NativeAdrenoMaintainOwnedPages(pool.virt,pool.bytes,NativeAdrenoCleanInvalidate);
++        pool.write_combined=false;
++    }
++    (void)pool.descriptor->complete();
++    pool.descriptor->release();
++    pool.descriptor=nullptr;pool.virt=nullptr;pool.physical=0;pool.bytes=0;pool.used=pool.peak=0;pool.count=0;
++    native_adreno_pool_stats[0]=0;
 +}
 +IOReturn NativeAdrenoMemory::reservePool(unsigned bits,size_t bytes)
 +{
@@ -9411,10 +9426,10 @@ index 0000000..cec75a7
 +}
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoMemory.h b/iokit/Kernel/arm/adreno/NativeAdrenoMemory.h
 new file mode 100644
-index 0000000..f91b19e
+index 0000000..308b9b1
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoMemory.h
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,111 @@
 +/* SPDX-License-Identifier: MIT */
 +#ifndef NATIVE_ADRENO_MEMORY_H
 +#define NATIVE_ADRENO_MEMORY_H
@@ -9483,6 +9498,8 @@ index 0000000..f91b19e
 +    /* The whole pool write-combined once, for good: a pooled BO then takes no page-attribute change on allocation or release.
 +     * Board only, after reservePool, when user BOs are write-combined. */
 +    static IOReturn writeCombinePool();
++    /* Gives the pool back to the VM (default attribute restored first). Only when no BO still lives in it; the board calls it on teardown. */
++    static void releasePool();
 +    /* Pins bytes at address in task (a user task's own pages) instead of allocating; prepare() wires them until release().
 +     * There is no kernel mapping: the owner keeps its CPU mapping and does its own cache maintenance around GPU use, so
 +     * publishForDevice/acquireDeviceWrites have nothing to do for this object. Spans and PA bounds are checked as for allocate. */
@@ -10798,10 +10815,10 @@ index 0000000..55c6a93
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..a17615c
+index 0000000..ce92595
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,682 @@
+@@ -0,0 +1,693 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -11132,6 +11149,8 @@ index 0000000..a17615c
 +    if (core_) { delete core_; core_ = nullptr; }
 +    if (execbuf_) { delete execbuf_; execbuf_ = nullptr; }
 +    if (gpu_ctx_) { delete gpu_ctx_; gpu_ctx_ = nullptr; }
++    /* A failed bring-up must not keep the BO pool: it is half of this machine's RAM. */
++    NativeAdrenoMemory::releasePool();
 +    ready_ = false;
 +    core_ready_ = false;
 +}
@@ -11172,7 +11191,7 @@ index 0000000..a17615c
 +
 +    /* Pool size boot argument */
 +    {
-+        uint32_t mib = 512;
++        uint32_t mib = 64;   /* the kernel owns 1 GiB on this board; 512 MiB starved userland */
 +        PE_parse_boot_argn("sheng-gpu-pool", &mib, sizeof(mib));
 +        native_adreno_pool_mib = mib;
 +    }
@@ -11224,6 +11243,15 @@ index 0000000..a17615c
 +    IOReturn ctx_ret = gpu_ctx_->bringUp(&smmu_io, 0, 1, gpu_slots, gpu_sids, nullptr, &ctx_report);
 +    if (ctx_ret != kIOReturnSuccess || !gpu_ctx_->ready()) {
 +        IOLog("NativeAdreno: GPU SMMU context bringUp failed (0x%x, step %u)\n", ctx_ret, ctx_report.step);
++        IOLog("NativeAdreno: DIAG ctx prog_status %u prog_phase %u prog_writes %u readback_valid %u enabled %u id1 0x%x route_status %u route_phase %u route_writes %u verified %u\n",
++            (unsigned)ctx_report.program_status, (unsigned)ctx_report.program_phase, (unsigned)ctx_report.program_writes,
++            (unsigned)ctx_report.program_readback_valid, (unsigned)ctx_report.program_enabled, (unsigned)ctx_report.id1,
++            (unsigned)ctx_report.route_status, (unsigned)ctx_report.route_phase, (unsigned)ctx_report.route_writes,
++            (unsigned)ctx_report.routes_verified);
++        auto rd = [&](size_t at) { uint32_t v = 0xdeadbeef; (void)smmu_read32(&smmu_win, at, &v); return (unsigned)v; };
++        IOLog("NativeAdreno: DIAG smmu sCR0 0x%x sGFSR 0x%x idr0 0x%x smr0 0x%x s2cr0 0x%x smr3 0x%x s2cr3 0x%x\n",
++            rd(0x00), rd(0x48), rd(0x20), rd(0x800), rd(0xc00), rd(0x80c), rd(0xc0c));
++        if (sweet_log_sync) sweet_log_sync();
 +        smmu_svc->release();
 +        gmu_svc->release();
 +        teardown();
