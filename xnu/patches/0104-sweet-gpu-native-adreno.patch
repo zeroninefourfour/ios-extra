@@ -10781,10 +10781,10 @@ index 0000000..17bbfdb
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..2969d8f
+index 0000000..7bba745
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,817 @@
+@@ -0,0 +1,820 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -11543,6 +11543,9 @@ index 0000000..2969d8f
 +    dev_info.ubwc_swizzle = 6;
 +    dev_info.macrotile_mode = 0;
 +    dev_info.ubwc_version = 2;
++    /* Turnip derives has_set_iova from this flag and only then runs util_vma_heap_init for its GPU address space. With flags 0 the heap stayed
++     * zeroed and the first BO allocation in backboardd (right after Query + GetDeviceInfo) walked holes.next == NULL: SIGSEGV, far 0x0. */
++    dev_info.flags = NativeAdrenoDeviceClientIova;
 +
 +    /* GPU clock for the user timestamp: CP_ALWAYS_ON_COUNTER in the GPU window (UniXNU-tb128fu GpuProbe.cpp does the same on A610). With no timer the
 +     * Timestamp method answered kIOReturnUnsupported. */
