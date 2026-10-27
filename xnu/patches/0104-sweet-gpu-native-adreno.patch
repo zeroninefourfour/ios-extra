@@ -2147,10 +2147,10 @@ index 0000000..da4f92a
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoA618HwInit.h b/iokit/Kernel/arm/adreno/NativeAdrenoA618HwInit.h
 new file mode 100644
-index 0000000..99c6f50
+index 0000000..4f8fae8
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoA618HwInit.h
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,183 @@
 +/* SPDX-License-Identifier: MIT */
 +#ifndef NATIVE_ADRENO_A618_HWINIT_H
 +#define NATIVE_ADRENO_A618_HWINIT_H
@@ -2215,6 +2215,14 @@ index 0000000..99c6f50
 +#define A618_CP_SQE_STAT_DATA 0x00909
 +#define A618_RBBM_INT_CLEAR_CMD 0x00037
 +#define A618_CP_ALWAYS_ON_COUNTER 0x00980
++#define A618_RB_NC_MODE_CNTL 0x08e08
++#define A618_TPL1_NC_MODE_CNTL 0x0b604
++#define A618_SP_NC_MODE_CNTL 0x0ae02
++#define A618_UCHE_MODE_CNTL 0x00e01
++#define A618_RBBM_NC_MODE_CNTL 0x00534
++#define A618_CP_PERFCTR_CP_SEL0 0x008d0
++#define A618_RBBM_STATUS_CP_AHB_BUSY_CX_MASTER 0x00000001u /* the one RBBM_STATUS bit mainline's idle check ignores */
++#define A618_RBBM_INT_0_HANG_DETECT 0x00800000u
 +
 +#define A618_CHIP_ID 0x06010800
 +#define A618_GMEM_SIZE 0x80000 /* 512 KiB */
@@ -10418,10 +10426,10 @@ index 0000000..570f464
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
 new file mode 100644
-index 0000000..7bf78f9
+index 0000000..b331b08
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,236 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "NativeAdrenoRing.h"
 +#include "AdrenoPM4.h"
@@ -10435,63 +10443,38 @@ index 0000000..7bf78f9
 +    if (sweet_log_sync) sweet_log_sync();
 +}
 +
-+/* Values are taken from the pinned Linux source, not guessed:
-+ * drivers/gpu/drm/msm/registers/adreno/a6xx.xml (register offsets), and
-+ * registers/adreno/adreno_pm4.xml (opcode 0x46 CP_EVENT_WRITE7, event 0x31
-+ * CACHE_CLEAN, WRITE_SRC bits 20..22, WRITE_DST bit 24, WRITE_ENABLED bit 27,
-+ * IRQ bit 31). CP_RB_CNTL BUFSZ bits 0..5 and BLKSZ bits 8..13 are the same
-+ * fields MSM_GPU_RB_CNTL_DEFAULT programs. All are dword register indices. */
++/* Values are taken from the pinned Linux source, not guessed: drivers/gpu/drm/msm/registers/adreno/a6xx.xml (register offsets)
++ * and adreno_pm4.xml (opcodes, A6XX vgt_event_type values). The packets are the ones a6xx_submit() and a6xx_set_pagetable()
++ * emit for an A6XX (A618), which has no BR/BV threads: no CP_THREAD_CONTROL, CP_SET_MARKER, CP_RESET_CONTEXT_STATE or
++ * CP_EVENT_WRITE7. CP_RB_CNTL BUFSZ bits 0..5 and BLKSZ bits 8..13 are the same fields MSM_GPU_RB_CNTL_DEFAULT programs.
++ * All are dword register indices. */
 +enum : uint32_t {
 +    RingBase = 0x0800,        /* 64-bit CP_RB_BASE */
 +    RingControl = 0x0802,     /* CP_RB_CNTL */
 +    RingRptrAddress = 0x0804, /* 64-bit CP_RB_RPTR_ADDR */
 +    RingRptr = 0x0806,
 +    RingWptr = 0x0807,
-+    RingScratch = 0x0885,     /* CP_SCRATCH(2) for A6XX..A7XX */
-+    RingFenceOpcode = 0x46,   /* CP_EVENT_WRITE7 on A7XX */
-+    RingFenceEvent = 0x31,    /* CACHE_CLEAN */
-+    RingA6xxFenceEvent = 4,   /* CACHE_FLUSH_TS on A6XX */
-+    RingFenceEnable = 1u << 27,
++    RingScratch = 0x0885,     /* CP_SCRATCH(2) */
++    RingEventWrite = 0x46,    /* CP_EVENT_WRITE */
++    RingCacheFlushTs = 4,     /* CACHE_FLUSH_TS: writes the timestamp after the caches are flushed */
++    RingCcuInvalidateDepth = 24,
++    RingCcuInvalidateColor = 25,
++    /* CACHE_INVALIDATE (UCHE). a6xx_set_pagetable() sends it after every page table switch; this ring has one VM and never sends
++     * CP_SMMU_TABLE_UPDATE, so each framed submission invalidates instead (on sheng, nothing else ever invalidated UCHE). */
++    RingCacheInvalidate = 49,
 +    RingFenceIrq = 1u << 31,
 +    RingBlockBytes = 32,
-+    /* A7XX framing, as a7xx_submit() in the pinned a6xx_gpu.c emits it: CP_THREAD_CONTROL (0x17; THREAD bits 0..1,
-+     * BR 1, BV 2, BOTH 3; SYNC_THREADS bit 31), CP_SET_MARKER (0x65; 0x101 IFPC disable, 0x100 enable), CCU_INVALIDATE_DEPTH
-+     * 0x18 / CCU_INVALIDATE_COLOR 0x19 and CP_WAIT_TIMESTAMP (0x14) from adreno_pm4.xml. User command streams synchronize
-+     * the BR and BV threads themselves (Turnip waits on BV timestamps), so the IBs must run with both threads enabled. */
-+    RingThreadControl = 0x17,
-+    RingThreadBr = 1,
-+    RingThreadBv = 2,
-+    RingThreadBoth = 3,
-+    RingSyncThreads = 1u << 31,
-+    RingSetMarker = 0x65,
-+    RingWaitTimestamp = 0x14,
-+    RingCcuInvalidateDepth = 0x18,
-+    RingCcuInvalidateColor = 0x19,
-+    /* What the SQE's CP_SMMU_TABLE_UPDATE handler does before it switches tables (a740_sqe.fw, qrisc-disasm): CACHE_FLUSH7 (0x32)
-+     * and CACHE_INVALIDATE7 (0x33) with a wait for idle (CP_WAIT_FOR_IDLE 0x26). Linux gets these from that packet on every context
-+     * switch; this ring never sends it, and event 0x31 is only CACHE_CLEAN on A7XX, so nothing else ever invalidated UCHE. */
-+    RingCacheFlush7 = 0x32,
-+    RingCacheInvalidate7 = 0x33,
-+    RingWaitForIdle = 0x26,
-+    RingPrologueWords = 11,
-+    /* a6xx_set_pagetable()'s A7XX context entry: CP_RESET_CONTEXT_STATE (0x1f; CLEAR_ON_CHIP_TS, CLEAR_RESOURCE_TABLE,
-+     * CLEAR_BV_BR_COUNTER, RESET_GLOBAL_LOCAL_TS = bits 0..3) between thread syncs, LRZ_FLUSH_INVALIDATE (0x26), the
-+     * RBBM_PERFCTR_SRAM_INIT_CMD (0x050e) write and CACHE_INVALIDATE (0x31), after a CP_WAIT_TIMESTAMP on the last fence, then the
-+     * CP_WAIT_REG_MEM (0x3c, WRITE_EQ) on RBBM_PERFCTR_SRAM_INIT_STATUS (0x050f) bit 0 that Linux always emits after the SRAM init
-+     * write. Without that wait the client's first IB started while the SRAM was still clearing; on sheng (int-064..067) the CP then
-+     * stopped on the IB's first CP_THREAD_CONTROL, while the same IB retired under the Linux driver. */
-+    RingResetContextState = 0x1f,
-+    RingResetAll = 0xf,
-+    RingLrzFlushInvalidate = 0x26,
-+    RingCacheInvalidate = 0x31,
++    /* a6xx_set_pagetable()'s entry for a new context: protected mode off, RBBM_PERFCTR_SRAM_INIT_CMD (0x050e) = 1, the
++     * CP_WAIT_REG_MEM (WRITE_EQ) on RBBM_PERFCTR_SRAM_INIT_STATUS (0x050f) bit 0, protected mode back on. Without the wait the
++     * client's first IB can start while the SRAM is still clearing (sheng int-064..067). */
++    RingSetProtectedMode = 0x5f,
 +    RingPerfctrSramInit = 0x050e,
 +    RingPerfctrSramInitStatus = 0x050f,
 +    RingWaitRegMem = 0x3c,
 +    RingWaitWriteEq = 3,
-+    RingResetWords = 26,
-+    RingFenceWords = 7,       /* kernel bring-up submissions: TYPE4 scratch + TYPE7 event */
-+    RingFramedFenceWords = 31,/* user submissions: scratch, BV timestamp, BR wait, ring timestamp */
-+    RingBvFenceOffset = 12    /* msm_rbmemptrs.bv_fence; +8 is bv_rptr, the BV RPTR shadow hw init programs */
++    RingPrologueWords = 6,    /* CCU depth + color invalidate, CACHE_INVALIDATE */
++    RingResetWords = 13,
++    RingFenceWords = 7        /* TYPE4 scratch + CP_EVENT_WRITE CACHE_FLUSH_TS, for kernel and user submissions alike */
 +};
 +static uint32_t ilog2(size_t value)
 +{
@@ -10519,37 +10502,27 @@ index 0000000..7bf78f9
 +    for(uint32_t i=0;i<count;++i)words[at+1+i]=payload[i];
 +    return at+1+count;
 +}
-+/* Thread selection and IFPC disable before the user buffers, as a7xx_submit() does; the first submission after
-+ * requestContextReset() also carries the context entry a6xx_set_pagetable() emits when a new context first submits.
-+ * Every prologue ends its BR-only part with the GPU cache flush and invalidate described at RingCacheFlush7. */
++/* What a6xx_submit() puts before the user buffers: CCU depth and color invalidate, plus the UCHE invalidate described at
++ * RingCacheInvalidate. The first submission after requestContextReset() starts with the new-context entry of
++ * a6xx_set_pagetable(). */
 +IOReturn NativeAdrenoRing::emitPrologue(uint32_t at,bool reset,uint32_t *end)
 +{
 +    const uint32_t mask=(uint32_t)(ring_bytes_/4-1);
-+    uint32_t words[RingPrologueWords+RingResetWords]={0};
-+    const uint32_t br=RingSyncThreads|RingThreadBr,syncBoth=RingSyncThreads|RingThreadBoth,both=RingThreadBoth,marker=0x101;
++    uint32_t words[RingResetWords+RingPrologueWords]={0};
 +    const uint32_t count=RingPrologueWords+(reset?RingResetWords:0);
-+    size_t n=packet(words,0,RingThreadControl,&br,1);
++    size_t n=0;
 +    if(reset) {
-+        const uint64_t at4=fence_iova_+4;
-+        const uint32_t wait[4]={0,(uint32_t)at4,(uint32_t)(at4>>32),seqno_},all=RingResetAll,lrz=RingLrzFlushInvalidate,
-+            invalidate=RingCacheInvalidate;
-+        if(n)n=packet(words,n,RingWaitTimestamp,wait,4);
-+        if(n)n=packet(words,n,RingThreadControl,&syncBoth,1);
-+        if(n)n=packet(words,n,RingResetContextState,&all,1);
-+        if(n)n=packet(words,n,RingThreadControl,&syncBoth,1);
-+        if(n)n=packet(words,n,RingFenceOpcode,&lrz,1);
-+        if(n)n=packet(words,n,RingThreadControl,&br,1);
++        const uint32_t off=0,on=1,sram[6]={RingWaitWriteEq,RingPerfctrSramInitStatus,0,1,1,0};
++        n=packet(words,n,RingSetProtectedMode,&off,1);
 +        if(n && AdrenoPM4Type4(RingPerfctrSramInit,1,&words[n])==AdrenoPM4Success) {words[n+1]=1;n+=2;} else n=0;
-+        if(n)n=packet(words,n,RingFenceOpcode,&invalidate,1);
-+        const uint32_t sram[6]={RingWaitWriteEq,RingPerfctrSramInitStatus,0,1,1,0};
 +        if(n)n=packet(words,n,RingWaitRegMem,sram,6);
++        if(n)n=packet(words,n,RingSetProtectedMode,&on,1);
++        if(!n)return poison();
 +    }
-+    const uint32_t flush=RingCacheFlush7,invalidate7=RingCacheInvalidate7;
-+    if(n)n=packet(words,n,RingFenceOpcode,&flush,1);
-+    if(n)n=packet(words,n,RingFenceOpcode,&invalidate7,1);
-+    if(n)n=packet(words,n,RingWaitForIdle,nullptr,0);
-+    if(n)n=packet(words,n,RingThreadControl,&both,1);
-+    if(n)n=packet(words,n,RingSetMarker,&marker,1);
++    const uint32_t depth=RingCcuInvalidateDepth,color=RingCcuInvalidateColor,invalidate=RingCacheInvalidate;
++    n=packet(words,n,RingEventWrite,&depth,1);
++    if(n)n=packet(words,n,RingEventWrite,&color,1);
++    if(n)n=packet(words,n,RingEventWrite,&invalidate,1);
 +    if(n!=count)return poison();
 +    for(uint32_t i=0;i<count;++i)ring_[(at+i)&mask]=words[i];
 +    *end=(at+count)&mask;return kIOReturnSuccess;
@@ -10560,45 +10533,15 @@ index 0000000..7bf78f9
 +    const uint32_t mask=(uint32_t)(ring_bytes_/4-1);
 +    uint32_t words[RingFenceWords]={0};
 +    if(AdrenoPM4Type4(RingScratch,1,&words[0])!=AdrenoPM4Success ||
-+        AdrenoPM4Type7(RingFenceOpcode,4,&words[2])!=AdrenoPM4Success)return poison();
++        AdrenoPM4Type7(RingEventWrite,4,&words[2])!=AdrenoPM4Success)return poison();
 +    words[1]=seqno;
-+    /* Sweet (A618): a6xx_submit's fence is CP_EVENT_WRITE CACHE_FLUSH_TS (4) | IRQ. The A7XX encoding above is event 0x31, which on A6XX is
-+     * CACHE_INVALIDATE (no timestamp write), and its WRITE_ENABLED bit means nothing there: CP_ME_INIT retired (rptr == wptr) but the fence stayed 0. */
-+    words[3]=RingA6xxFenceEvent|RingFenceIrq;
-+    /* The timestamp goes to +4 (msm_rbmemptrs.fence), where wait() reads it; +0 is the CP's RPTR shadow. */
++    /* a6xx_submit's fence: CP_EVENT_WRITE CACHE_FLUSH_TS | IRQ. (The A7XX form, event 0x31 with WRITE_ENABLED, is CACHE_INVALIDATE
++     * here and writes no timestamp.) The timestamp goes to +4 (msm_rbmemptrs.fence), where wait() reads it. */
++    words[3]=RingCacheFlushTs|RingFenceIrq;
 +    const uint64_t at4=fence_iova_+4;
 +    words[4]=(uint32_t)at4;words[5]=(uint32_t)(at4>>32);words[6]=seqno;
 +    for(uint32_t i=0;i<RingFenceWords;++i)ring_[(at+i)&mask]=words[i];
 +    *end=(at+RingFenceWords)&mask;return kIOReturnSuccess;
-+}
-+/* The fence of a framed submission: CP_SCRATCH(2), the BV thread's timestamp, a BR wait for it (so BR cannot report the
-+ * submission while BV still works on it), then the ring timestamp with an interrupt, both threads and IFPC back on. */
-+IOReturn NativeAdrenoRing::emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end)
-+{
-+    const uint32_t mask=(uint32_t)(ring_bytes_/4-1);
-+    uint32_t words[RingFramedFenceWords]={0};
-+    if(AdrenoPM4Type4(RingScratch,1,&words[0])!=AdrenoPM4Success)return poison();
-+    words[1]=seqno;
-+    /* The timestamp goes to +4 (msm_rbmemptrs.fence), where wait() reads it; +0 is the CP's RPTR shadow. */
-+    const uint64_t at4=fence_iova_+4,bv=fence_iova_+RingBvFenceOffset;
-+    const uint32_t br=RingThreadBr,bvThread=RingThreadBv,both=RingThreadBoth,depth=RingCcuInvalidateDepth,
-+        color=RingCcuInvalidateColor,marker=0x100;
-+    const uint32_t bvWrite[4]={RingFenceEvent|RingFenceEnable,(uint32_t)bv,(uint32_t)(bv>>32),seqno};
-+    const uint32_t bvWait[4]={0,(uint32_t)bv,(uint32_t)(bv>>32),seqno};
-+    const uint32_t fence[4]={RingFenceEvent|RingFenceEnable|RingFenceIrq,(uint32_t)at4,(uint32_t)(at4>>32),seqno};
-+    size_t n=packet(words,2,RingThreadControl,&br,1);
-+    if(n)n=packet(words,n,RingFenceOpcode,&depth,1);
-+    if(n)n=packet(words,n,RingFenceOpcode,&color,1);
-+    if(n)n=packet(words,n,RingThreadControl,&bvThread,1);
-+    if(n)n=packet(words,n,RingFenceOpcode,bvWrite,4);
-+    if(n)n=packet(words,n,RingThreadControl,&br,1);
-+    if(n)n=packet(words,n,RingWaitTimestamp,bvWait,4);
-+    if(n)n=packet(words,n,RingFenceOpcode,fence,4);
-+    if(n)n=packet(words,n,RingThreadControl,&both,1);
-+    if(n)n=packet(words,n,RingSetMarker,&marker,1);
-+    if(n!=RingFramedFenceWords)return poison();
-+    for(uint32_t i=0;i<RingFramedFenceWords;++i)ring_[(at+i)&mask]=words[i];
-+    *end=(at+RingFramedFenceWords)&mask;return kIOReturnSuccess;
 +}
 +IOReturn NativeAdrenoRing::attach(const NativeAdrenoRingIo *io,const NativeAdrenoRingCache *cache,
 +    void *ring,size_t ring_bytes,uint64_t ring_iova,void *fence,size_t fence_bytes,uint64_t fence_iova)
@@ -10651,7 +10594,7 @@ index 0000000..7bf78f9
 +    if(!words || !word_count || word_count>SIZE_MAX/sizeof(uint32_t))return kIOReturnBadArgument;
 +    const uint32_t size_words=(uint32_t)(ring_bytes_/4),mask=size_words-1;
 +    const bool reset=framed && reset_pending_;
-+    const uint32_t extra=framed?RingPrologueWords+(reset?RingResetWords:0)+RingFramedFenceWords:RingFenceWords;
++    const uint32_t extra=(framed?RingPrologueWords+(reset?RingResetWords:0):0)+RingFenceWords;
 +    if(word_count>size_words-extra-8)return kIOReturnNoResources;
 +    uint32_t rptr=0;IOReturn status=readRptr(&rptr);
 +    if(status)return status;
@@ -10665,7 +10608,7 @@ index 0000000..7bf78f9
 +    for(size_t i=0;i<word_count;++i)ring_[(at+i)&mask]=words[i];
 +    at=(at+(uint32_t)word_count)&mask;
 +    uint32_t end=0;
-+    status=framed?emitFramedFence(at,seqno_+1,&end):emitFence(at,seqno_+1,&end);
++    status=emitFence(at,seqno_+1,&end);
 +    if(status)return status;
 +    /* Whole-ring publication is deliberate: a submission may wrap, and one
 +     * clean of the owned pool is cheaper than a split range proof. */
@@ -10725,10 +10668,10 @@ index 0000000..7bf78f9
 +}
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.h b/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
 new file mode 100644
-index 0000000..55c6a93
+index 0000000..17bbfdb
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,100 @@
 +/* SPDX-License-Identifier: MIT */
 +#ifndef NATIVE_ADRENO_RING_H
 +#define NATIVE_ADRENO_RING_H
@@ -10736,7 +10679,7 @@ index 0000000..55c6a93
 +#include <stddef.h>
 +#include <stdint.h>
 +
-+/* A7XX command processor ring and timestamp fence, not a scheduler.
++/* A6XX (A618) command processor ring and timestamp fence, not a scheduler.
 + * Register indices are dword offsets; the platform adds the MMIO base and
 + * multiplies by four. Caller must already own an exclusive, powered GPU with
 + * SQE microcode loaded (CP_SQE_INSTR_BASE), global reset released and all
@@ -10786,7 +10729,6 @@ index 0000000..55c6a93
 +    IOReturn readRptr(uint32_t *);
 +    IOReturn emitPrologue(uint32_t at,bool reset,uint32_t *end);
 +    IOReturn emitFence(uint32_t at,uint32_t seqno,uint32_t *end);
-+    IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end);
 +    IOReturn submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed);
 +public:
 +    NativeAdrenoRing()=default;
@@ -10807,11 +10749,11 @@ index 0000000..55c6a93
 +     * it with one WPTR update. Returns a nonzero fence value on success. The
 +     * words are copied; the caller's buffer is never retained. */
 +    IOReturn submit(const uint32_t *words,size_t word_count,uint32_t *fence);
-+    /* User command buffers: the A7XX BR/BV thread framing of a7xx_submit() around the words (CP init and the kernel's own
-+     * bring-up packets keep the plain submit() above, as Linux sends them outside a7xx_submit()). */
++    /* User command buffers: the framing of a6xx_submit() around the words (CCU and UCHE invalidates before, the same fence after;
++     * CP init and the kernel's own bring-up packets keep the plain submit() above, as Linux sends them outside a6xx_submit()). */
 +    IOReturn submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence);
-+    /* The next framed submission starts with the A7XX context entry of a6xx_set_pagetable() (BR/BV counters, on-chip
-+     * timestamps and resource table cleared between thread syncs); a new user client requests it, as Linux does per context. */
++    /* The next framed submission starts with the new-context entry of a6xx_set_pagetable() (perfcounter SRAM cleared with
++     * protected mode off); a new user client requests it, as Linux does per context. */
 +    void requestContextReset() {reset_pending_=true;}
 +    /* Polls the CP-written timestamp after invalidating the fence page. Never
 +     * writes registers and never advances the ring. Timeout is not poison. */
@@ -10832,10 +10774,10 @@ index 0000000..55c6a93
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..0b2afa7
+index 0000000..0a8b618
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,754 @@
+@@ -0,0 +1,789 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -11317,9 +11259,11 @@ index 0000000..0b2afa7
 +        gpu_write32(&gpu_window, reg_off, 1);
 +    }
 +
-+    /* 3. Program HWCG clockgating table */
++    /* 3. HWCG off: the table's "on" values with RBBM_CLOCK_CNTL 0 were neither of mainline a6xx_set_hwcg's states. Its "off" state is
++     * every table register 0 and RBBM_CLOCK_CNTL 0 (Fuchsia msd-qcom-adreno also brings the GPU up with clock gating disabled).
++     * Turning it on also needs the GMU CGC registers and the SPTPRAC clock toggle around the table. */
 +    for (unsigned i = 0; i < NATIVE_ADRENO_A618_HWCG_COUNT; i++) {
-+        gpu_write32(&gpu_window, NativeAdrenoA618Hwcg[i][0], NativeAdrenoA618Hwcg[i][1]);
++        gpu_write32(&gpu_window, NativeAdrenoA618Hwcg[i][0], 0);
 +    }
 +    gpu_write32(&gpu_window, A618_RBBM_CLOCK_CNTL, 0);
 +    gpu_write32(&gpu_window, A618_RBBM_VBIF_CLIENT_QOS_CNTL, 0x3);
@@ -11340,6 +11284,15 @@ index 0000000..0b2afa7
 +    gpu_write32(&gpu_window, A618_UCHE_CACHE_WAYS, 0x4);
 +    gpu_write32(&gpu_window, A618_UCHE_CLIENT_PF, (1u << 7) | 1u);
 +
++    /* a6xx_set_ubwc_config with sm7150_data (UBWC 2.0, swizzle LVL2|LVL3, highest bank bit 14; sweet DT also says 14):
++     * hbb_lo = 14 - 13 = 1, no UBWC 1.0 mode, no AMSBC, 32-byte min access, no macrotile. */
++    gpu_write32(&gpu_window, A618_RB_NC_MODE_CNTL, 1u << 1);
++    gpu_write32(&gpu_window, A618_TPL1_NC_MODE_CNTL, 1u << 1);
++    gpu_write32(&gpu_window, A618_SP_NC_MODE_CNTL, 1u << 1);
++    gpu_write32(&gpu_window, A618_UCHE_MODE_CNTL, 1u << 21);
++    gpu_write32(&gpu_window, A618_RBBM_NC_MODE_CNTL, 0);
++    gpu_write32(&gpu_window, A618_CP_PERFCTR_CP_SEL0, 0); /* PERF_CP_ALWAYS_COUNT */
++
 +    /* 5. Configure CP thresholds, pool size, APRIV */
 +    gpu_write32(&gpu_window, A618_CP_ROQ_THRESHOLDS_2, 0x010000c0);
 +    gpu_write32(&gpu_window, A618_CP_ROQ_THRESHOLDS_1, 0x8040362c);
@@ -11358,7 +11311,8 @@ index 0000000..0b2afa7
 +    for (unsigned i = 0; i < NATIVE_ADRENO_A618_PROTECT_COUNT; i++) {
 +        gpu_write32(&gpu_window, A618_CP_PROTECT + i, NativeAdrenoA618Protect[i][1]);
 +    }
-+    gpu_write32(&gpu_window, A618_CP_PROTECT_CNTL, 1);
++    /* a6xx_set_cp_protect: ACCESS_PROT_EN | ACCESS_FAULT_ON_VIOL_EN | LAST_SPAN_INF_RANGE */
++    gpu_write32(&gpu_window, A618_CP_PROTECT_CNTL, (1u << 3) | (1u << 1) | 1u);
 +
 +    /* 7. Configure CP Ring registers */
 +    gpu_write32(&gpu_window, A618_CP_SQE_INSTR_BASE, static_cast<uint32_t>(GpuSqeIova));
@@ -11414,7 +11368,8 @@ index 0000000..0b2afa7
 +    svc_step("cp-me-init-submitted");
 +    NativeAdrenoRingClock clock{ nullptr, ring_now, nullptr };
 +    /* 200 ms: the first CACHE_FLUSH_TS after power-up may take longer than the old 2 ms. */
-+    if (ring_.wait(init_fence, &clock, 200000, nullptr) != NativeAdrenoRingFenceComplete) {
++    const bool init_fence_ok = ring_.wait(init_fence, &clock, 200000, nullptr) == NativeAdrenoRingFenceComplete;
++    if (!init_fence_ok) {
 +        IOLog("NativeAdreno: A6xx CP_ME_INIT fence %u timed out\n", init_fence);
 +        if (sweet_log_sync) sweet_log_sync();
 +        {
@@ -11454,15 +11409,39 @@ index 0000000..0b2afa7
 +                (unsigned)mp[0], (unsigned)mp[1], g(A618_RBBM_STATUS), g(0x885));
 +            if (sweet_log_sync) sweet_log_sync();
 +        }
-+        smmu_svc->release();
-+        gmu_svc->release();
-+        teardown();
-+        return false;
++        /* Mainline a6xx_cp_init, KGSL a6xx_send_cp_init and Fuchsia InitControlProcessor all judge ME_INIT by idle, not by a memory
++         * write: RPTR caught up with WPTR, nothing in RBBM_STATUS but CP_AHB_BUSY_CX_MASTER, no hang interrupt. They only switch out
++         * of secure mode after that, so a fence written while still secure is not required here; the smoke test checks writes. */
++        uint32_t rptr = 0xdeadbeef, wptr = 0, status = 0xdeadbeef, int0 = 0xdeadbeef;
++        (void)gpu_read32(&gpu_window, A618_CP_RB_RPTR, &rptr);
++        (void)gpu_read32(&gpu_window, A618_CP_RB_WPTR, &wptr);
++        (void)gpu_read32(&gpu_window, A618_RBBM_STATUS, &status);
++        (void)gpu_read32(&gpu_window, A618_RBBM_INT_0_STATUS, &int0);
++        const bool idle = rptr == wptr && !(status & ~A618_RBBM_STATUS_CP_AHB_BUSY_CX_MASTER) &&
++            !(int0 & A618_RBBM_INT_0_HANG_DETECT);
++        IOLog("NativeAdreno: CP_ME_INIT idle check rptr 0x%x wptr 0x%x rbbm_status 0x%x int0 0x%x -> %s\n",
++            (unsigned)rptr, (unsigned)wptr, (unsigned)status, (unsigned)int0, idle ? "retired" : "NOT idle");
++        if (sweet_log_sync) sweet_log_sync();
++        if (!idle) {
++            smmu_svc->release();
++            gmu_svc->release();
++            teardown();
++            return false;
++        }
++    } else {
++        IOLog("NativeAdreno: A6xx CP_ME_INIT completed successfully (fence %u)\n", init_fence);
 +    }
-+    IOLog("NativeAdreno: A6xx CP_ME_INIT completed successfully (fence %u)\n", init_fence);
 +
-+    /* Switch out of secure mode */
++    /* Switch out of secure mode. Without a zap shader mainline does this register write; on a Qualcomm-TZ board that needs the zap
++     * shader (sweet's DT names a615_zap) the write may be blocked or raise an access violation, hence the marker and the readback. */
++    svc_step("secvid-trust-cntl");
 +    gpu_write32(&gpu_window, A618_RBBM_SECVID_TRUST_CNTL, 0);
++    {
++        uint32_t trust = 0xdeadbeef;
++        (void)gpu_read32(&gpu_window, A618_RBBM_SECVID_TRUST_CNTL, &trust);
++        IOLog("NativeAdreno: RBBM_SECVID_TRUST_CNTL after write 0x%x\n", (unsigned)trust);
++        if (sweet_log_sync) sweet_log_sync();
++    }
 +
 +    svc_step("smoke-test");
 +    /* 10. Smoke Test: CP memory writeback */
@@ -11479,24 +11458,22 @@ index 0000000..0b2afa7
 +    smoke_pm4[3] = 0xad618001u;
 +
 +    uint32_t smoke_fence = 0;
-+    bool smoke_ok = false;
 +    IOReturn smoke_sub_ret = ring_.submit(smoke_pm4, 4, &smoke_fence);
-+    if (smoke_sub_ret == kIOReturnSuccess &&
-+        ring_.wait(smoke_fence, &clock, 200000, nullptr) == NativeAdrenoRingFenceComplete) {
-+        const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(4)).acquireDeviceWrites(0, 4);
-+        uint32_t val = scratch[0];
-+        if (val == 0xad618001u) {
-+            IOLog("NativeAdreno: Adreno 618 CP MEMORY WRITEBACK SMOKE TEST PASSED! Pattern 0x%08x verified\n", val);
-+            smoke_ok = true;
-+        } else {
-+            IOLog("NativeAdreno: smoke test scratch readback mismatch: 0x%08x (expected 0xad618001)\n", val);
-+        }
++    /* The pattern (CP_MEM_WRITE) and the fence (CACHE_FLUSH_TS event) are separate write paths: report both. */
++    const bool smoke_fence_ok = smoke_sub_ret == kIOReturnSuccess &&
++        ring_.wait(smoke_fence, &clock, 200000, nullptr) == NativeAdrenoRingFenceComplete;
++    const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(4)).acquireDeviceWrites(0, 4);
++    const uint32_t smoke_val = scratch[0];
++    const bool smoke_ok = smoke_fence_ok && smoke_val == 0xad618001u;
++    if (smoke_ok) {
++        IOLog("NativeAdreno: Adreno 618 CP MEMORY WRITEBACK SMOKE TEST PASSED! Pattern 0x%08x verified\n", (unsigned)smoke_val);
 +    } else {
-+        IOLog("NativeAdreno: smoke test submission / fence wait failed\n");
++        IOLog("NativeAdreno: smoke test failed: submit 0x%x fence %u %s, scratch 0x%08x (expected 0xad618001)\n",
++            smoke_sub_ret, smoke_fence, smoke_fence_ok ? "landed" : "timed out", (unsigned)smoke_val);
 +    }
 +    if (sweet_log_sync) sweet_log_sync();
 +    /* AGXAccelerator makes backboardd switch to the native Metal device; with a CP that cannot write memory that blanks the
-+     * screen, so nothing is published until the smoke test passes. */
++     * screen, so nothing is published until the smoke test passes (pattern and fence: every user submission waits on a fence). */
 +    if (!smoke_ok) {
 +        IOLog("NativeAdreno: smoke test failed, AGXAccelerator not published\n");
 +        smmu_svc->release();
@@ -11537,7 +11514,7 @@ index 0000000..0b2afa7
 +    dev_info.chip_id = A618_CHIP_ID;
 +    dev_info.gmem_bytes = A618_GMEM_SIZE;
 +    dev_info.gmem_base = 0x100000;
-+    dev_info.uche_trap_base = 0x100000;
++    dev_info.uche_trap_base = 0x1fffffffff000ull; /* mainline adreno_gpu->uche_trap_base for A6xx; 0x100000 is the GMEM window */
 +    dev_info.va_start = 0x20000000;
 +    dev_info.va_size = 0x60000000;
 +    dev_info.highest_bank_bit = 14;
@@ -12552,7 +12529,7 @@ index 0000000..4366105
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoUserClient.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoUserClient.cpp
 new file mode 100644
-index 0000000..b3dd3b6
+index 0000000..858b069
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoUserClient.cpp
 @@ -0,0 +1,597 @@
@@ -12622,7 +12599,7 @@ index 0000000..b3dd3b6
 +    vm_=vm;submit_=submit;ring_=ring;input_bits_=input_bits;output_bits_=output_bits;
 +    next_handle_=1;open_=true;
 +    queues_[0]={0,true};
-+    /* Each client is a new GPU context for the CP: its first submission clears the BR/BV synchronization state. */
++    /* Each client is a new GPU context for the CP: its first submission carries the new-context entry (perfcounter SRAM clear). */
 +    ring_->requestContextReset();
 +    return kIOReturnSuccess;
 +}
