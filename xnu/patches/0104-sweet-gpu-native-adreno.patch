@@ -10774,10 +10774,10 @@ index 0000000..17bbfdb
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..4c77d13
+index 0000000..67faca6
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,794 @@
+@@ -0,0 +1,799 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -11515,7 +11515,10 @@ index 0000000..4c77d13
 +    }
 +
 +    /* 12. Publish NativeAdrenoGpu service */
-+    NativeAdrenoAbiDeviceInfo dev_info{};
++    /* native_adreno_publish keeps this pointer and every client open attaches it later (attachDeviceInfo checks reserved/chip_id/va_size):
++     * as a stack variable it was garbage by then, the attach failed silently and GetDeviceInfo answered kIOReturnUnsupported. */
++    static NativeAdrenoAbiDeviceInfo dev_info{};
++    dev_info = NativeAdrenoAbiDeviceInfo{};
 +    dev_info.chip_id = A618_CHIP_ID;
 +    dev_info.gmem_bytes = A618_GMEM_SIZE;
 +    dev_info.gmem_base = 0x100000;
@@ -11527,7 +11530,9 @@ index 0000000..4c77d13
 +    dev_info.macrotile_mode = 0;
 +    dev_info.ubwc_version = 2;
 +
-+    native_adreno_publish(gpu_ctx_->vm(), execbuf_, &ring_, &clock, nullptr, &dev_info, 32, 40);
++    const IOReturn publish_ret = native_adreno_publish(gpu_ctx_->vm(), execbuf_, &ring_, &clock, nullptr, &dev_info, 32, 40);
++    IOLog("NativeAdreno: NativeAdrenoGpu publish 0x%x (device info chip 0x%x va 0x%llx+0x%llx)\n", publish_ret,
++        (unsigned)dev_info.chip_id, (unsigned long long)dev_info.va_start, (unsigned long long)dev_info.va_size);
 +
 +    ready_ = true;
 +    IOLog("NativeAdreno: GPU driver fully ready, publishing service\n");
