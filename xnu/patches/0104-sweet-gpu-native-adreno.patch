@@ -10774,10 +10774,10 @@ index 0000000..17bbfdb
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..0a8b618
+index 0000000..3c7362e
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,789 @@
+@@ -0,0 +1,781 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -11432,16 +11432,8 @@ index 0000000..0a8b618
 +        IOLog("NativeAdreno: A6xx CP_ME_INIT completed successfully (fence %u)\n", init_fence);
 +    }
 +
-+    /* Switch out of secure mode. Without a zap shader mainline does this register write; on a Qualcomm-TZ board that needs the zap
-+     * shader (sweet's DT names a615_zap) the write may be blocked or raise an access violation, hence the marker and the readback. */
-+    svc_step("secvid-trust-cntl");
-+    gpu_write32(&gpu_window, A618_RBBM_SECVID_TRUST_CNTL, 0);
-+    {
-+        uint32_t trust = 0xdeadbeef;
-+        (void)gpu_read32(&gpu_window, A618_RBBM_SECVID_TRUST_CNTL, &trust);
-+        IOLog("NativeAdreno: RBBM_SECVID_TRUST_CNTL after write 0x%x\n", (unsigned)trust);
-+        if (sweet_log_sync) sweet_log_sync();
-+    }
++    /* Mainline writes RBBM_SECVID_TRUST_CNTL = 0 here when no zap shader was loaded. On sweet (DT names a615_zap) that access hung
++     * the SoC: fe31b51 booted to the secvid-trust-cntl marker, then the log and the USB console both stopped. Not written. */
 +
 +    svc_step("smoke-test");
 +    /* 10. Smoke Test: CP memory writeback */
