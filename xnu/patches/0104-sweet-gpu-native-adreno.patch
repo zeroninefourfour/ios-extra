@@ -10418,10 +10418,10 @@ index 0000000..570f464
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
 new file mode 100644
-index 0000000..2f6e73a
+index 0000000..7bf78f9
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,301 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "NativeAdrenoRing.h"
 +#include "AdrenoPM4.h"
@@ -10614,7 +10614,8 @@ index 0000000..2f6e73a
 +    ring_bytes_=ring_bytes;ring_iova_=ring_iova;
 +    fence_=static_cast<volatile uint32_t *>(fence);fence_bytes_=fence_bytes;fence_iova_=fence_iova;
 +    for(size_t i=0;i<fence_bytes_/4;++i)fence_[i]=0;
-+    const uint32_t control=(uint32_t)(ilog2(ring_bytes/8)&0x3f)|(ilog2(RingBlockBytes/8)<<8);
++    /* NO_UPDATE (bit 27): A618 has no hw APRIV, so like mainline the CP keeps no RPTR shadow; readRptr() uses the register. */
++    const uint32_t control=(uint32_t)(ilog2(ring_bytes/8)&0x3f)|(ilog2(RingBlockBytes/8)<<8)|(1u<<27);
 +    const uint32_t base_lo=(uint32_t)ring_iova_,base_hi=(uint32_t)(ring_iova_>>32);
 +    const uint32_t rptr_lo=(uint32_t)fence_iova_,rptr_hi=(uint32_t)(fence_iova_>>32);
 +    const uint32_t writes[]={RingBase,base_lo,RingBase+1,base_hi,RingControl,control,
@@ -10831,10 +10832,10 @@ index 0000000..55c6a93
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..fab5b28
+index 0000000..0b2afa7
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,734 @@
+@@ -0,0 +1,754 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -11348,7 +11349,9 @@ index 0000000..fab5b28
 +    gpu_write32(&gpu_window, A618_RBBM_PERFCTR_CNTL, 1);
 +    gpu_write32(&gpu_window, A618_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
 +    gpu_write32(&gpu_window, A618_RBBM_INTERFACE_HANG_INT_CNTL, (1u << 30) | 0x1fffff);
-+    gpu_write32(&gpu_window, A618_CP_APRIV_CNTL, (1u << 6) | (1u << 5) | (1u << 3) | (1u << 2) | (1u << 1));
++    /* No CP_APRIV_CNTL: A618 lacks ADRENO_QUIRK_HAS_HW_APRIV in mainline a6xx_catalog.c, so a6xx_hw_init never writes it.
++     * The old value 0x6e (CDWRITE|CDREAD|RBRPWB|RBPRIVLEVEL|RBFETCH) is the A650-family one; it made the CP's memory writes
++     * privileged while ring/memptrs are mapped unprivileged, and 4b83768/a13f720 saw rptr==wptr, scratch2==1, fence never landing. */
 +    gpu_write32(&gpu_window, A618_RBBM_INT_0_MASK, 0x00000020);
 +
 +    /* 6. Program CP Protect registers */
@@ -11362,7 +11365,9 @@ index 0000000..fab5b28
 +    gpu_write32(&gpu_window, A618_CP_SQE_INSTR_BASE + 1, static_cast<uint32_t>(GpuSqeIova >> 32));
 +    gpu_write32(&gpu_window, A618_CP_RB_BASE, static_cast<uint32_t>(GpuRingIova));
 +    gpu_write32(&gpu_window, A618_CP_RB_BASE + 1, static_cast<uint32_t>(GpuRingIova >> 32));
-+    gpu_write32(&gpu_window, A618_CP_RB_CNTL, (2u << 8) | 12u); /* MSM_GPU_RB_CNTL_DEFAULT: 32 KiB ring (BUFSZ 12), BLKSZ 2 */
++    /* MSM_GPU_RB_CNTL_DEFAULT (32 KiB ring: BUFSZ 12, BLKSZ 2) | AXXX_CP_RB_CNTL_NO_UPDATE: without hw APRIV mainline turns the
++     * hardware RPTR shadow off; the ring reads CP_RB_RPTR from the register instead. */
++    gpu_write32(&gpu_window, A618_CP_RB_CNTL, (1u << 27) | (2u << 8) | 12u);
 +    gpu_write32(&gpu_window, A618_CP_RB_RPTR_ADDR, static_cast<uint32_t>(GpuMemptrsIova));
 +    gpu_write32(&gpu_window, A618_CP_RB_RPTR_ADDR + 1, static_cast<uint32_t>(GpuMemptrsIova >> 32));
 +    gpu_write32(&gpu_window, A618_CP_RB_RPTR, 0);
@@ -11429,6 +11434,10 @@ index 0000000..fab5b28
 +            /* CP_SCRATCH_REG(2) is written by the first packet of the fence submission (seqno 1);
 +             * CP_STATUS_1 / CP_PROTECT_STATUS for CP state. */
 +            IOLog("NativeAdreno: DIAG cp2 scratch2 0x%x status1 0x%x protect_status 0x%x\n", g(0x885), g(0x825), g(0x824));
++            /* Read back what hw init programmed: APRIV must stay 0 on A618, RB_CNTL carries NO_UPDATE. */
++            IOLog("NativeAdreno: DIAG cp3 apriv 0x%x rb_cntl 0x%x rptr_addr 0x%x:%x rb_base 0x%x:%x\n",
++                g(A618_CP_APRIV_CNTL), g(A618_CP_RB_CNTL), g(A618_CP_RB_RPTR_ADDR + 1), g(A618_CP_RB_RPTR_ADDR),
++                g(A618_CP_RB_BASE + 1), g(A618_CP_RB_BASE));
 +            {
 +                const volatile uint32_t *rb = reinterpret_cast<const volatile uint32_t *>(
 +                    const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(1)).mapping());
@@ -11470,18 +11479,30 @@ index 0000000..fab5b28
 +    smoke_pm4[3] = 0xad618001u;
 +
 +    uint32_t smoke_fence = 0;
++    bool smoke_ok = false;
 +    IOReturn smoke_sub_ret = ring_.submit(smoke_pm4, 4, &smoke_fence);
 +    if (smoke_sub_ret == kIOReturnSuccess &&
-+        ring_.wait(smoke_fence, &clock, 2000, nullptr) == NativeAdrenoRingFenceComplete) {
++        ring_.wait(smoke_fence, &clock, 200000, nullptr) == NativeAdrenoRingFenceComplete) {
 +        const_cast<NativeAdrenoMemory &>(gpu_ctx_->buffer(4)).acquireDeviceWrites(0, 4);
 +        uint32_t val = scratch[0];
 +        if (val == 0xad618001u) {
 +            IOLog("NativeAdreno: Adreno 618 CP MEMORY WRITEBACK SMOKE TEST PASSED! Pattern 0x%08x verified\n", val);
++            smoke_ok = true;
 +        } else {
 +            IOLog("NativeAdreno: smoke test scratch readback mismatch: 0x%08x (expected 0xad618001)\n", val);
 +        }
 +    } else {
 +        IOLog("NativeAdreno: smoke test submission / fence wait failed\n");
++    }
++    if (sweet_log_sync) sweet_log_sync();
++    /* AGXAccelerator makes backboardd switch to the native Metal device; with a CP that cannot write memory that blanks the
++     * screen, so nothing is published until the smoke test passes. */
++    if (!smoke_ok) {
++        IOLog("NativeAdreno: smoke test failed, AGXAccelerator not published\n");
++        smmu_svc->release();
++        gmu_svc->release();
++        teardown();
++        return false;
 +    }
 +
 +    /* Setup submit and core user clients */
