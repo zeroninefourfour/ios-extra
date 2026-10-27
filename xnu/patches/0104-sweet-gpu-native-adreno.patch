@@ -9552,10 +9552,10 @@ index 0000000..308b9b1
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp
 new file mode 100644
-index 0000000..e5f7f74
+index 0000000..b50cafd
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp
-@@ -0,0 +1,726 @@
+@@ -0,0 +1,733 @@
 +/* SPDX-License-Identifier: MIT */
 +/* IOKit surface for an already-running GPU context. The board code (kits/sheng) brings the GPU up, then hands this file
 + * the live VM, submit object, ring, clock and optional timer; one IOService is published and each IOServiceOpen creates a
@@ -9997,6 +9997,13 @@ index 0000000..e5f7f74
 +    native_adreno_metal_diag.calls=native_adreno_metal_diag.calls+1;
 +    native_adreno_metal_diag.last_selector=method;
 +    native_adreno_metal_diag.last_status=uint32_t(status);
++    /* bring-up trace: the first calls of every client, one line each. When a client dies the last line names the method it was in. */
++    static uint32_t call_log_budget=600;
++    if(call_log_budget) {
++        --call_log_budget;
++        IOLog("NativeAdrenoUC: %s method %u in %lu out %lu -> 0x%x\n",connection->name_,method,(unsigned long)input_size,
++            (unsigned long)output_size,(unsigned)status);
++    }
 +    return status;
 +}
 +IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
@@ -10774,10 +10781,10 @@ index 0000000..17bbfdb
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..67faca6
+index 0000000..2969d8f
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,799 @@
+@@ -0,0 +1,817 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -10876,6 +10883,12 @@ index 0000000..67faca6
 +    volatile uint8_t *base;
 +    size_t bytes;
 +};
++/* The ring and the timestamp reader keep a pointer to the GPU window for as long as the device lives: it must not be a local of the
++ * function that brings the GPU up (the ring copied its io struct with cookie = &local, and the first user submission would have
++ * kicked CP_RB_WPTR through whatever the stack held by then). */
++static NativeAdrenoGpuWindow native_adreno_gpu_window;
++static NativeAdrenoTimer native_adreno_timer;
++static NativeAdrenoTimeIo native_adreno_timer_io;
 +
 +class NativeAdrenoGpuService : public IOService {
 +    OSDeclareDefaultStructors(NativeAdrenoGpuService)
@@ -11235,7 +11248,8 @@ index 0000000..67faca6
 +
 +    svc_step("cp-register-init");
 +    /* Initialize Adreno 618 CP hardware */
-+    NativeAdrenoGpuWindow gpu_window = {
++    NativeAdrenoGpuWindow &gpu_window = native_adreno_gpu_window;
++    gpu_window = {
 +        reinterpret_cast<volatile uint8_t *>(maps_[0]->getVirtualAddress()),
 +        static_cast<size_t>(win0_bytes_)
 +    };
@@ -11530,7 +11544,18 @@ index 0000000..67faca6
 +    dev_info.macrotile_mode = 0;
 +    dev_info.ubwc_version = 2;
 +
-+    const IOReturn publish_ret = native_adreno_publish(gpu_ctx_->vm(), execbuf_, &ring_, &clock, nullptr, &dev_info, 32, 40);
++    /* GPU clock for the user timestamp: CP_ALWAYS_ON_COUNTER in the GPU window (UniXNU-tb128fu GpuProbe.cpp does the same on A610). With no timer the
++     * Timestamp method answered kIOReturnUnsupported. */
++    native_adreno_timer_io = NativeAdrenoTimeIo{ &native_adreno_gpu_window, gpu_read32 };
++    const IOReturn timer_ret = native_adreno_timer.attach(&native_adreno_timer_io, NativeAdrenoTimeCp);
++    uint64_t ticks_a = 0, ticks_b = 0;
++    const IOReturn read_a = timer_ret ? timer_ret : native_adreno_timer.read(&ticks_a);
++    IODelay(1000);
++    const IOReturn read_b = timer_ret ? timer_ret : native_adreno_timer.read(&ticks_b);
++    IOLog("NativeAdreno: timer attach 0x%x read 0x%x/0x%x ticks %llu -> %llu (1 ms apart)\n", timer_ret, read_a, read_b,
++        (unsigned long long)ticks_a, (unsigned long long)ticks_b);
++    const IOReturn publish_ret = native_adreno_publish(gpu_ctx_->vm(), execbuf_, &ring_, &clock,
++        timer_ret ? nullptr : &native_adreno_timer, &dev_info, 32, 40);
 +    IOLog("NativeAdreno: NativeAdrenoGpu publish 0x%x (device info chip 0x%x va 0x%llx+0x%llx)\n", publish_ret,
 +        (unsigned)dev_info.chip_id, (unsigned long long)dev_info.va_start, (unsigned long long)dev_info.va_size);
 +
