@@ -10433,10 +10433,10 @@ index 0000000..570f464
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
 new file mode 100644
-index 0000000..b331b08
+index 0000000..981ba9c
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,277 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "NativeAdrenoRing.h"
 +#include "AdrenoPM4.h"
@@ -10494,12 +10494,22 @@ index 0000000..b331b08
 +{
 +    poisoned_=true;return kIOReturnIOError;
 +}
++/* Bring-up: names the call site of every poison() (the first one is the cause; later submits only see NotReady/IOError). */
++static void ring_poison_note(unsigned line)
++{
++    static uint32_t budget=16;
++    if(budget) {--budget;IOLog("NativeAdrenoRing: poison() at line %u\n",line);}
++}
++#define poison() (ring_poison_note(__LINE__),poison())
 +IOReturn NativeAdrenoRing::readRptr(uint32_t *value)
 +{
 +    uint32_t rptr=0;
 +    ring_mark("read RB_RPTR");
 +    if(io_.read32(io_.cookie,RingRptr,&rptr))return poison();
-+    if(rptr>=ring_bytes_/4)return poison(); /* unusable read pointer */
++    if(rptr>=ring_bytes_/4) {
++        IOLog("NativeAdrenoRing: unusable RB_RPTR 0x%x (ring is %lu words)\n",rptr,(unsigned long)(ring_bytes_/4));
++        return poison(); /* unusable read pointer */
++    }
 +    *value=rptr;rptr_shadow_=rptr;return kIOReturnSuccess;
 +}
 +/* Packs one TYPE7 packet into words; returns the next free index or 0 when the header cannot be built. */
@@ -10632,6 +10642,20 @@ index 0000000..b331b08
 +    ring_mark("write RB_WPTR");
 +    if(io_.write32(io_.cookie,RingWptr,end))return poison();
 +    ring_mark("RB_WPTR written");
++    {
++        /* Bring-up: the packets the CP is about to read (first submissions only), 8 words per line. */
++        static uint32_t budget=6;
++        if(budget) {
++            --budget;
++            const uint32_t total=(end-next_)&mask;
++            IOLog("NativeAdrenoRing: submit fence %u ring %u..%u (%u words, rptr was %u, framed %d reset %d)\n",seqno_+1,next_,end,total,rptr,(int)framed,(int)reset);
++            for(uint32_t i=0;i<total && i<48;i+=8) {
++                uint32_t w[8]={0};
++                for(uint32_t j=0;j<8 && i+j<total;++j)w[j]=ring_[(next_+i+j)&mask];
++                IOLog("NativeAdrenoRing:   [%2u] %08x %08x %08x %08x %08x %08x %08x %08x\n",i,w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7]);
++            }
++        }
++    }
 +    next_=end;*fence=++seqno_;++submissions_;
 +    if(reset)reset_pending_=false;
 +    return kIOReturnSuccess;
@@ -10667,9 +10691,26 @@ index 0000000..b331b08
 +        const uint32_t value=fence_[1];
 +        if(observed)*observed=value;
 +        if(value>=fence) {if(value>seqno_) {poison();return NativeAdrenoRingFencePoisoned;}completed_=value;
++            static uint32_t done_budget=8;
++            if(done_budget) {--done_budget;IOLog("NativeAdrenoRing: fence %u complete (seen %u, newest %u)\n",fence,value,seqno_);}
 +            return NativeAdrenoRingFenceComplete;}
 +        if(!clock || !clock->now_us)return NativeAdrenoRingFenceTimeout;
-+        if(clock->now_us(clock->cookie)-start>=timeout_us) {ring_mark("wait timeout");return NativeAdrenoRingFenceTimeout;}
++        if(clock->now_us(clock->cookie)-start>=timeout_us) {
++            ring_mark("wait timeout");
++            /* Bring-up: where the CP stands when a fence is late. Register indices (dwords) from a6xx.xml: RBBM_INT_0_STATUS 0x201,
++             * RBBM_STATUS 0x210, RBBM_STATUS1 0x211, CP_HW_FAULT 0x821, CP_STATUS_1 0x825, CP_IB1_BASE 0x928 (64 bit), CP_IB1_REM_SIZE 0x92a.
++             * Plain reads; a failed read leaves the all-ones marker. */
++            static uint32_t budget=6;
++            if(budget) {
++                --budget;
++                uint32_t r[9];for(unsigned i=0;i<9;++i)r[i]=0xffffffffu;
++                static const uint32_t regs[9]={RingRptr,0x0201,0x0210,0x0211,0x0821,0x0825,0x0928,0x0929,0x092a};
++                for(unsigned i=0;i<9;++i){uint32_t v=0;if(!io_.read32(io_.cookie,regs[i],&v))r[i]=v;}
++                IOLog("NativeAdrenoRing: late fence %u: memptrs [%08x %08x %08x %08x] newest %u next %u | rptr %u int0 %08x status %08x status1 %08x hwfault %08x cpstat1 %08x ib1 %08x%08x rem %08x\n",
++                    fence,fence_[0],fence_[1],fence_[2],fence_[3],seqno_,next_,r[0],r[1],r[2],r[3],r[4],r[5],r[7],r[6],r[8]);
++            }
++            return NativeAdrenoRingFenceTimeout;
++        }
 +        if(clock->idle && clock->idle(clock->cookie))return NativeAdrenoRingFenceTimeout;
 +    }
 +}
@@ -12084,10 +12125,10 @@ index 0000000..fa69ac8
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
 new file mode 100644
-index 0000000..238ebb6
+index 0000000..7722186
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,308 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "NativeAdrenoSubmit.h"
 +#include "AdrenoPM4.h"
@@ -12115,6 +12156,13 @@ index 0000000..238ebb6
 +{
 +    poisoned_=true;return kIOReturnIOError;
 +}
++/* Bring-up: names the call site of every poison() (the first one is the cause). */
++static void submit_note(const char *what,unsigned line,int status)
++{
++    static uint32_t budget=24;
++    if(budget) {--budget;IOLog("NativeAdrenoSubmit: %s at line %u status 0x%x\n",what,line,(unsigned)status);}
++}
++#define poison() (submit_note("poison()",__LINE__,0),poison())
 +NativeAdrenoSubmit::Job *NativeAdrenoSubmit::find(uint32_t fence)
 +{
 +    if(fence)for(auto &job:jobs_)if(job.active && job.fence==fence)return &job;
@@ -12177,9 +12225,13 @@ index 0000000..238ebb6
 +            return kIOReturnBadArgument;
 +        uint64_t iova=0;size_t bytes=0;unsigned permissions=0;
 +        IOReturn status=vm_->describe(buffer.handle,&iova,&bytes,&permissions);
-+        if(status)return status;
++        if(status) {submit_note("describe() failed",__LINE__,status);return status;}
 +        if(!(permissions&ArmSmmu4KRead) || buffer.iova<iova ||
-+            buffer.iova-iova>bytes || buffer.bytes>bytes-(buffer.iova-iova))return kIOReturnBadArgument;
++            buffer.iova-iova>bytes || buffer.bytes>bytes-(buffer.iova-iova)) {
++            IOLog("NativeAdrenoSubmit: IB outside its BO: buffer iova 0x%llx bytes 0x%llx, BO iova 0x%llx bytes 0x%llx perm 0x%x\n",(unsigned long long)buffer.iova,
++                (unsigned long long)buffer.bytes,(unsigned long long)iova,(unsigned long long)bytes,permissions);
++            return kIOReturnBadArgument;
++        }
 +        uint32_t header=0;
 +        if(AdrenoPM4Type7(SubmitIndirectBuffer,SubmitIbWords,&header)!=AdrenoPM4Success)
 +            return poison();
@@ -12192,12 +12244,13 @@ index 0000000..238ebb6
 +        if(!known)handles[handle_count++]=buffer.handle;
 +    }
 +    IOReturn swept=retireCompleted();
-+    if(swept)return swept;
++    if(swept) {submit_note("retireCompleted() failed",__LINE__,swept);return swept;}
 +    Job *job=free();
-+    if(!job)return kIOReturnBusy;
++    if(!job) {submit_note("no free job slot",__LINE__,kIOReturnBusy);return kIOReturnBusy;}
 +    for(size_t i=0;i<handle_count;++i) {
 +        IOReturn status=vm_->holdJob(handles[i]);
 +        if(status) {
++            submit_note("holdJob() failed",__LINE__,status);
 +            while(i) {vm_->retireJobAfterCompletion(handles[--i]);++stats_.references_retired;}
 +            return status;
 +        }
@@ -12256,6 +12309,7 @@ index 0000000..238ebb6
 +        status=vm_->invalidateTlb();
 +    }
 +    if(status) {
++        submit_note("publishMapped()/invalidateTlb() failed",__LINE__,status);
 +        for(size_t i=0;i<handle_count;++i) {vm_->retireJobAfterCompletion(handles[i]);++stats_.references_retired;}
 +        return status;
 +    }
@@ -12267,8 +12321,23 @@ index 0000000..238ebb6
 +        for(unsigned i=0;i<28;++i)native_adreno_ib_log[slot][4+i]=head[i];
 +        native_adreno_ib_log_count=native_adreno_ib_log_count+1;
 +    }
++    {
++        /* Bring-up: the first IB's head as the kernel reads it through the GPU mapping (first submissions only). */
++        static uint32_t budget=6;
++        if(budget) {
++            --budget;
++            uint32_t head[28]={0};(void)vm_->peekWords(buffers[0].iova,head,28);
++            IOLog("NativeAdrenoSubmit: %lu IB(s), first iova 0x%llx bytes 0x%llx, cached/dram/after word0 %08x/%08x/%08x\n",(unsigned long)count,
++                (unsigned long long)buffers[0].iova,(unsigned long long)buffers[0].bytes,cached,before,after);
++            for(unsigned i=0;i<28;i+=8) {
++                IOLog("NativeAdrenoSubmit:   IB[%2u] %08x %08x %08x %08x %08x %08x %08x %08x\n",i,head[i],head[i+1],head[i+2],head[i+3],
++                    i+4<28?head[i+4]:0,i+5<28?head[i+5]:0,i+6<28?head[i+6]:0,i+7<28?head[i+7]:0);
++            }
++        }
++    }
 +    status=ring_->submitFramed(words,word_count,&value);
 +    if(status) {
++        submit_note("submitFramed() failed",__LINE__,status);
 +        /* A poisoned ring may already have consumed the WPTR write, so the
 +         * referenced buffers cannot be retired here. */
 +        if(ring_->poisoned()) {
@@ -12567,10 +12636,10 @@ index 0000000..4366105
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoUserClient.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoUserClient.cpp
 new file mode 100644
-index 0000000..858b069
+index 0000000..73b75f0
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoUserClient.cpp
-@@ -0,0 +1,597 @@
+@@ -0,0 +1,608 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "NativeAdrenoUserClient.h"
 +extern "C" volatile uint32_t native_adreno_trace_stage;
@@ -12841,6 +12910,17 @@ index 0000000..858b069
 +    uint32_t fence=0;
 +    const IOReturn status=submit_->submit(buffers,request->buffer_count,
 +        queue_base_+static_cast<uint32_t>(request->queue),&fence);
++    {
++        /* Bring-up: what each of the first submissions asked for and how it ended. */
++        static uint32_t budget=12;
++        if(budget) {
++            --budget;
++            IOLog("NativeAdrenoUC: submit %u buffer(s) queue %llu wait_fence %llu -> 0x%x fence %u; buffer0 handle 0x%llx iova 0x%llx bytes 0x%llx\n",
++                request->buffer_count,(unsigned long long)request->queue,(unsigned long long)request->wait_fence,(unsigned)status,fence,
++                (unsigned long long)request->buffers[0].handle,(unsigned long long)request->buffers[0].iova,
++                (unsigned long long)request->buffers[0].bytes);
++        }
++    }
 +    if(status)return status;
 +    reply->fence=fence;
 +    return kIOReturnSuccess;
@@ -13289,10 +13369,10 @@ index 0000000..bcd1728
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
 new file mode 100644
-index 0000000..917cbd9
+index 0000000..2e099d9
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
-@@ -0,0 +1,444 @@
+@@ -0,0 +1,461 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "NativeAdrenoVm.h"
 +#include "NativeAdrenoVmAlias.h"
@@ -13380,6 +13460,13 @@ index 0000000..917cbd9
 +    result_.quarantine=ArmSmmu4KFaultStreams(&io_,streams_,&routes);
 +    return kIOReturnIOError;
 +}
++/* Bring-up: the first fail() poisons the VM and every later submit only sees an error, so the call site of the first one is the cause. */
++static void vm_fail_note(unsigned line,int status)
++{
++    static uint32_t budget=16;
++    if(budget) {--budget;IOLog("NativeAdrenoVm: fail() at line %u status %d\n",line,status);}
++}
++#define fail(status) (vm_fail_note(__LINE__,(int)(status)),fail(status))
 +IOReturn NativeAdrenoVm::attach(const ArmSmmu4KIo *io,ArmSmmu4KContextConfig *context,
 +    ArmSmmu4KStreamState *streams,const NativeAdrenoVmRegion *lower,const NativeAdrenoVmRegion *upper,
 +    size_t capacity,unsigned budget)
@@ -13626,7 +13713,12 @@ index 0000000..917cbd9
 +        const Mapping &m=mappings_[i];
 +        if(!m.memory)continue;
 +        if(coherentMapping(m.writeback)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
-+        if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_))return fail(ArmSmmu4KIoError);
++        const IOReturn published=m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_);
++        if(published) {
++            IOLog("NativeAdrenoVm: publishMapped slot %lu iova 0x%llx bytes 0x%lx writeback %u -> 0x%x\n",(unsigned long)i,
++                (unsigned long long)m.iova,(unsigned long)m.memory->bytes(),m.writeback,(unsigned)published);
++            return fail(ArmSmmu4KIoError);
++        }
 +    }
 +    return kIOReturnSuccess;
 +}
@@ -13637,7 +13729,12 @@ index 0000000..917cbd9
 +        const Mapping &m=mappings_[i];
 +        if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite))continue;
 +        if(coherentMapping(m.writeback)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
-+        if(m.memory->acquireDeviceWrites(0,m.memory->bytes()))return fail(ArmSmmu4KIoError);
++        const IOReturn acquired=m.memory->acquireDeviceWrites(0,m.memory->bytes());
++        if(acquired) {
++            IOLog("NativeAdrenoVm: acquireImported slot %lu iova 0x%llx bytes 0x%lx -> 0x%x\n",(unsigned long)i,
++                (unsigned long long)m.iova,(unsigned long)m.memory->bytes(),(unsigned)acquired);
++            return fail(ArmSmmu4KIoError);
++        }
 +    }
 +    return kIOReturnSuccess;
 +}
