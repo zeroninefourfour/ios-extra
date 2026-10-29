@@ -1,8 +1,8 @@
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 68612db..522f5c8 100644
+index 68612db..6a78f4b 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -6870,6 +6870,345 @@ static const char * init_programs[] = {
+@@ -6870,6 +6870,349 @@ static const char * init_programs[] = {
   * 3		2		NA		/usr/appleinternal/sbin/launchd.development
   * 4		3		1		/sbin/launchd
   */
@@ -155,17 +155,21 @@ index 68612db..522f5c8 100644
 +{
 +	vnode_t probe = NULLVP;
 +	int error = vnode_lookup("/private/var/ngpu/addons/NativeAdrenoMetal.bundle/NativeAdrenoMetal", 0, &probe, vfs_context_current());
-+	if (!error) {
++	const bool present = (error == 0);
++	if (present) {
 +		vnode_put(probe);
-+		printf("SWEET: native_gpu_addon: already present on disk, skipping auto-provision\n");
-+		return;
 +	}
 +
-+	printf("SWEET: native_gpu_addon: /private/var/ngpu not found, checking memory RAMDisk for payload...\n");
++	/* The RAMDisk tar is the source of truth: a copy left on disk by an earlier boot used to make this function return here, so every
++	 * rebuilt addon (new NativeAdrenoMetal, new CDHash in the trust cache) was ignored and the old binary kept running (observed:
++	 * 2026-10-29, log "unexpected _MTLDevice ABI" without the new "(instance size" suffix). With a payload the files are rewritten
++	 * every boot; without one the copy on disk is used as before. */
++	printf("SWEET: native_gpu_addon: %s on disk, checking memory RAMDisk for payload...\n", present ? "present" : "/private/var/ngpu not found");
 +	extern int mdevgetrange(int devid, uint64_t *base, uint64_t *size);
 +	uint64_t ram_base = 0, ram_size = 0;
 +	if (mdevgetrange(0, &ram_base, &ram_size) != 0 || ram_base == 0 || ram_size < 512) {
-+		printf("SWEET: native_gpu_addon: RAMDisk not available (base=0x%llx, size=%llu)\n", ram_base, ram_size);
++		printf("SWEET: native_gpu_addon: RAMDisk not available (base=0x%llx, size=%llu)%s\n", ram_base, ram_size,
++		    present ? ", keeping the copy on disk" : "");
 +		return;
 +	}
 +
@@ -348,7 +352,7 @@ index 68612db..522f5c8 100644
  void
  load_init_program(proc_t p)
  {
-@@ -6884,6 +7223,8 @@ load_init_program(proc_t p)
+@@ -6884,6 +7227,8 @@ load_init_program(proc_t p)
  	(void) memorystatus_init_at_boot_snapshot();
  #endif /* CONFIG_MEMORYSTATUS */
  
