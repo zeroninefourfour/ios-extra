@@ -9552,10 +9552,10 @@ index 0000000..308b9b1
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp
 new file mode 100644
-index 0000000..b61f60d
+index 0000000..671e410
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp
-@@ -0,0 +1,739 @@
+@@ -0,0 +1,749 @@
 +/* SPDX-License-Identifier: MIT */
 +/* IOKit surface for an already-running GPU context. The board code (kits/sheng) brings the GPU up, then hands this file
 + * the live VM, submit object, ring, clock and optional timer; one IOService is published and each IOServiceOpen creates a
@@ -9834,7 +9834,17 @@ index 0000000..b61f60d
 +}
 +IOReturn AGXDeviceUserClient::clientClose()
 +{
++    /* The user mappings of every cached view go before any page is freed. The line before shows a close that panicked inside the teardown
++     * (no "close ... releaseAll" line follows it); the forced-unmap count after shows whether the client still had mappings to cut. */
++    static uint32_t begin_budget=24;
++    const uint32_t forced_before=native_adreno_metal_diag.forced_unmaps;
++    if(begin_budget) {--begin_budget;IOLog("NativeAdrenoUC: close %s slot %u begin\n",name_,slot_);}
 +    dropViews(0);
++    static uint32_t cut_budget=24;
++    if(cut_budget && native_adreno_metal_diag.forced_unmaps!=forced_before) {
++        --cut_budget;
++        IOLog("NativeAdrenoUC: close %s slot %u cut %u user mapping(s)\n",name_,slot_,(unsigned)(native_adreno_metal_diag.forced_unmaps-forced_before));
++    }
 +    IOLockLock(g.lock);
 +    IOReturn status=kIOReturnSuccess;
 +    AGXDeviceUserClient *mailbox=nullptr;
@@ -14194,10 +14204,42 @@ index 06bb568..71239d0 100644
  	return pa - gPhysBase + gVirtBase;
  }
 diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
-index 00568d3..57d6465 100644
+index 00568d3..3423d47 100644
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
-@@ -6881,7 +6881,8 @@ void
+@@ -48,6 +48,7 @@
+ #include <kern/spl.h>
+ #include <kern/startup.h>
+ #include <kern/trustcache.h>
++#include <kern/backtrace.h>
+ 
+ #include <os/overflow.h>
+ 
+@@ -2806,6 +2807,23 @@ pmap_assert_free(ppnum_t ppnum)
+ 		pmap_t pmap = ptep_get_pmap(first_ptep);
+ 		const char *type = (pmap == kernel_pmap) ? "Kernel" : "User";
+ 
++		/* sweet: a user mapping outliving the page is reported (who frees it, where it is mapped) and cut, so the log survives and names the
++		 * freeing path; a kernel mapping still panics. A few reports only: a driver that does this on every free must be fixed, not tolerated. */
++		static unsigned sweet_assert_free_budget = 16;
++		if (pmap != kernel_pmap && sweet_assert_free_budget) {
++			uintptr_t frames[12] = {0};
++			const unsigned depth = backtrace(frames, 12, NULL, NULL);
++			--sweet_assert_free_budget;
++			printf("SWEET pmap_assert_free: user mapping left at pa %#llx ptep %p va %#llx pmap %p, freed by pid %d, cutting it. bt",
++			    (uint64_t)pa, first_ptep, (uint64_t)ptep_get_va(first_ptep), pmap, task_pid(current_task()));
++			for (unsigned i = 0; i < depth; i++) {
++				printf(" %#llx", (uint64_t)frames[i]);
++			}
++			printf("\n");
++			pmap_page_protect(ppnum, VM_PROT_NONE);
++			return;
++		}
++
+ 		panic("%s: Found at least one mapping to %#llx. First PTEP (%p) is a "
+ 		    "%s CPU mapping (pmap: %p)",
+ 		    __func__, (uint64_t)pa, first_ptep, type, pmap);
+@@ -6881,7 +6899,8 @@ void
  pmap_sync_page_attributes_phys(
  	ppnum_t pp)
  {
