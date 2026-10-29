@@ -10822,10 +10822,10 @@ index 0000000..17bbfdb
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 new file mode 100644
-index 0000000..7bba745
+index 0000000..7c514af
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -0,0 +1,820 @@
+@@ -0,0 +1,825 @@
 +/* SPDX-License-Identifier: MIT */
 +/*
 + * IOKit driver for Qualcomm Adreno 618 (SM7150 / Sweet).
@@ -11247,7 +11247,12 @@ index 0000000..7bba745
 +        teardown();
 +        return false;
 +    }
-+    NativeAdrenoSmmuWindow smmu_win{ smmu_base, smmu_bytes };
++    /* The ArmSmmu4KIo is copied into the context, the VM and the SMMU context and every copy keeps this cookie, which the first TLB sync of a
++     * user submission dereferences long after start() returned: as a stack local it was garbage by then (every access failed -> ArmSmmu4KIoError
++     * -> VM poisoned -> kIOReturnIOError on the first Submit, "DeviceLost"). Same lifetime bug as dev_info and gpu_window. */
++    static NativeAdrenoSmmuWindow smmu_win_storage;
++    smmu_win_storage = NativeAdrenoSmmuWindow{ smmu_base, smmu_bytes };
++    NativeAdrenoSmmuWindow &smmu_win = smmu_win_storage;
 +    ArmSmmu4KIo smmu_io{ &smmu_win, smmu_bytes, smmu_read32, smmu_read64, smmu_write32, smmu_write64, smmu_barrier };
 +    const unsigned gpu_slots[2] = { 0, 0 };
 +    const uint16_t gpu_sids[2] = { 0, 0 };
