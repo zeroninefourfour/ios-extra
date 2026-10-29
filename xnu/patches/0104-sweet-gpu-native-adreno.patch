@@ -9552,10 +9552,10 @@ index 0000000..308b9b1
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp
 new file mode 100644
-index 0000000..b50cafd
+index 0000000..b61f60d
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp
-@@ -0,0 +1,733 @@
+@@ -0,0 +1,739 @@
 +/* SPDX-License-Identifier: MIT */
 +/* IOKit surface for an already-running GPU context. The board code (kits/sheng) brings the GPU up, then hands this file
 + * the live VM, submit object, ring, clock and optional timer; one IOService is published and each IOServiceOpen creates a
@@ -9842,6 +9842,10 @@ index 0000000..b50cafd
 +    if(live_) {
 +        const uint64_t peak=core_->windowPeak();
 +        status=core_->releaseAll(&g.clock,2000000);
++        {
++            static uint32_t close_budget=24;
++            if(close_budget) {--close_budget;IOLog("NativeAdrenoUC: close %s slot %u kernel %d releaseAll -> 0x%x\n",name_,slot_,(int)kernel_,(unsigned)status);}
++        }
 +        /* A failed teardown leaves the objects live and the slot taken: nothing is forced or reused. */
 +        if(!status) {
 +            live_=false;
@@ -10225,6 +10229,8 @@ index 0000000..b50cafd
 +    if(capped)refusal=kIOReturnBusy;
 +    else if(!connection->mount(kernel))refusal=kIOReturnBusy;   /* every slot taken */
 +    if(refusal) {
++        IOLog("NativeAdrenoUC: open refused for %s (0x%x): slots taken %d%d%d kernel_client %d, opened %u closed %u\n",opener,(unsigned)refusal,(int)g.slots[0],
++            (int)g.slots[1],(int)g.slots[2],(int)g.kernel_client,(unsigned)g.opened,(unsigned)g.closed);
 +        connection->release();
 +        native_adreno_metal_diag.busy=native_adreno_metal_diag.busy+1;
 +        IOLockLock(g.lock);
@@ -12641,10 +12647,10 @@ index 0000000..4366105
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoUserClient.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoUserClient.cpp
 new file mode 100644
-index 0000000..73b75f0
+index 0000000..21836ee
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoUserClient.cpp
-@@ -0,0 +1,608 @@
+@@ -0,0 +1,622 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "NativeAdrenoUserClient.h"
 +extern "C" volatile uint32_t native_adreno_trace_stage;
@@ -12741,14 +12747,28 @@ index 0000000..73b75f0
 +    if(!open_)return kIOReturnNotReady;
 +    if(!clock)return kIOReturnBadArgument;
 +    IOReturn status=submit_->waitRange(queue_base_,NativeAdrenoAbiMaxQueues,clock,timeout_us);
-+    if(status)return status;
++    if(status) {
++        /* Bring-up: a failed teardown keeps the connection slot taken (the next open then gets kIOReturnBusy). */
++        static uint32_t wait_budget=8;
++        if(wait_budget) {--wait_budget;IOLog("NativeAdrenoUC: releaseAll: outstanding jobs not done, waitRange -> 0x%x\n",(unsigned)status);}
++        return status;
++    }
 +    for(size_t index=0;index<entry_count_;++index) {
 +        Entry &entry=entries_[index];
 +        if(!entry.used)continue;
 +        entry.mapping_leases=0;
 +        NativeAdrenoAbiBoFree request{entry.handle};
 +        status=freeBo(&request);
-+        if(status)return status;
++        if(status) {
++            static uint32_t free_budget=8;
++            if(free_budget) {
++                --free_budget;
++                IOLog("NativeAdrenoUC: releaseAll: freeBo handle 0x%llx token %u bytes 0x%llx mapped %d iova 0x%llx unreleasable %d -> 0x%x\n",
++                    (unsigned long long)entry.handle,entry.token,(unsigned long long)entry.memory.bytes(),(int)entry.mapped_state,
++                    (unsigned long long)entry.iova,(int)entry.unreleasable,(unsigned)status);
++            }
++            return status;
++        }
 +    }
 +    for(size_t i=1;i<NativeAdrenoAbiMaxQueues;++i)queues_[i]=Queue{};
 +    return close();
