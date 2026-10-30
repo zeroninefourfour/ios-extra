@@ -9552,10 +9552,10 @@ index 0000000..308b9b1
 +#endif
 diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp
 new file mode 100644
-index 0000000..671e410
+index 0000000..1600938
 --- /dev/null
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp
-@@ -0,0 +1,749 @@
+@@ -0,0 +1,753 @@
 +/* SPDX-License-Identifier: MIT */
 +/* IOKit surface for an already-running GPU context. The board code (kits/sheng) brings the GPU up, then hands this file
 + * the live VM, submit object, ring, clock and optional timer; one IOService is published and each IOServiceOpen creates a
@@ -9827,8 +9827,12 @@ index 0000000..671e410
 +        if(views_)for(size_t i=0;i<MaxViews;++i) {View &v=views_[i];if(v.descriptor && (!token || v.token==token)) {view=v.descriptor;v.descriptor=nullptr;v.token=0;break;}}
 +        IOLockUnlock(g.lock);
 +        if(!view)return;
-+        /* The returned reference is the last one outside the descriptor's own list: dropping it frees the map, which unmaps the user range. */
-+        while(removeMappingForDescriptor(view))native_adreno_metal_diag.forced_unmaps=native_adreno_metal_diag.forced_unmaps+1;
++        /* removeMappingForDescriptor hands back the reference the client's list held (OSPtr is a plain pointer here): releasing it is what frees the
++         * map and unmaps the user range. Dropped without the release, the map stayed alive and every "cut" mapping outlived the BO's pages. */
++        while(IOMemoryMap *map=removeMappingForDescriptor(view)) {
++            map->release();
++            native_adreno_metal_diag.forced_unmaps=native_adreno_metal_diag.forced_unmaps+1;
++        }
 +        view->release();
 +    }
 +}
@@ -14204,7 +14208,7 @@ index 06bb568..71239d0 100644
  	return pa - gPhysBase + gVirtBase;
  }
 diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
-index 00568d3..3423d47 100644
+index 00568d3..b5bba65 100644
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
 @@ -48,6 +48,7 @@
@@ -14215,31 +14219,27 @@ index 00568d3..3423d47 100644
  
  #include <os/overflow.h>
  
-@@ -2806,6 +2807,23 @@ pmap_assert_free(ppnum_t ppnum)
+@@ -2806,6 +2807,19 @@ pmap_assert_free(ppnum_t ppnum)
  		pmap_t pmap = ptep_get_pmap(first_ptep);
  		const char *type = (pmap == kernel_pmap) ? "Kernel" : "User";
  
-+		/* sweet: a user mapping outliving the page is reported (who frees it, where it is mapped) and cut, so the log survives and names the
-+		 * freeing path; a kernel mapping still panics. A few reports only: a driver that does this on every free must be fixed, not tolerated. */
-+		static unsigned sweet_assert_free_budget = 16;
-+		if (pmap != kernel_pmap && sweet_assert_free_budget) {
++		/* sweet: name the freeing path and the mapping before the panic (the panic string has no backtrace). Not tolerated: cutting the PTE leaves
++		 * the user's VM entry, and a later touch faults the page back in after the VM has reused it (heap corruption, kfree zone confusion). */
++		if (pmap != kernel_pmap) {
 +			uintptr_t frames[12] = {0};
 +			const unsigned depth = backtrace(frames, 12, NULL, NULL);
-+			--sweet_assert_free_budget;
-+			printf("SWEET pmap_assert_free: user mapping left at pa %#llx ptep %p va %#llx pmap %p, freed by pid %d, cutting it. bt",
++			printf("SWEET pmap_assert_free: user mapping left at pa %#llx ptep %p va %#llx pmap %p, freed by pid %d. bt",
 +			    (uint64_t)pa, first_ptep, (uint64_t)ptep_get_va(first_ptep), pmap, task_pid(current_task()));
 +			for (unsigned i = 0; i < depth; i++) {
 +				printf(" %#llx", (uint64_t)frames[i]);
 +			}
 +			printf("\n");
-+			pmap_page_protect(ppnum, VM_PROT_NONE);
-+			return;
 +		}
 +
  		panic("%s: Found at least one mapping to %#llx. First PTEP (%p) is a "
  		    "%s CPU mapping (pmap: %p)",
  		    __func__, (uint64_t)pa, first_ptep, type, pmap);
-@@ -6881,7 +6899,8 @@ void
+@@ -6881,7 +6895,8 @@ void
  pmap_sync_page_attributes_phys(
  	ppnum_t pp)
  {
