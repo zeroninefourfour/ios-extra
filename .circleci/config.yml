@@ -1,5 +1,9 @@
 version: 2.1
 
+# Port of .github/workflows/xnu.yml. Keep the two in step.
+# Trigger it by hand with pipeline parameters (CircleCI UI "Trigger Pipeline", or API with
+# "parameters": {...}); pushes to main run it with the defaults.
+
 parameters:
   macos_version:
     type: string
@@ -20,14 +24,15 @@ parameters:
   use_ccache:
     type: boolean
     default: true
-    description: "compile through ccache"
+    description: "compile through ccache (set false for a from-scratch build if a cached object is suspected)"
 
 jobs:
   build:
     macos:
-      # Xcode 15.4.0 matches the xnu-8796 IORPC ABI (Xcode 16 iig breaks compatibility)
+      # Only Xcode 15.x on CircleCI's M4 Pro images. The xnu-8796 IORPC ABI needs an Xcode 15
+      # iig (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks).
+      # NOTE: the GitHub job used Xcode_15.0 / SDK 14.0; this is 15.4.0 / SDK 14.5 (unverified).
       xcode: "15.4.0"
-    # m4pro.medium (or macos.m1.medium.gen1 depending on account settings)
     resource_class: m4pro.medium
     environment:
       DXB_REPO: "https://github.com/blacktop/darwin-xnu-build"
@@ -36,102 +41,156 @@ jobs:
       KERNEL_CONFIG: "<< pipeline.parameters.kernel_config >>"
       MACHINE_CONFIG: "<< pipeline.parameters.machine_config >>"
       USE_CCACHE: "<< pipeline.parameters.use_ccache >>"
-      CCACHE_DIR: "/Users/distiller/project/.ccache"
-      CCACHE_BASEDIR: "/Users/distiller/project"
+      KEEP_GOING: "<< pipeline.parameters.keep_going >>"
+      # preprocessor mode (no direct mode) hashes the preprocessed source, so a fresh
+      # checkout's mtimes cannot cause a stale hit; the compiler is hashed by content
       CCACHE_NODIRECT: "1"
       CCACHE_COMPILERCHECK: "content"
       CCACHE_MAXSIZE: "1G"
     steps:
       - checkout
 
-      - name: Fetch build script and apply Sweet patches
-        command: |
-          git init -q dxb
-          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
-          git -C dxb checkout -q FETCH_HEAD
-          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
-          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
-          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
-          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
-          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
-          ls dxb/patches
+      - run:
+          name: Environment (workspace paths, Xcode)
+          command: |
+            # CircleCI does not expand ~ or $PWD in `environment:`, so export from here
+            {
+              echo "export CCACHE_DIR=\"$PWD/.ccache\""
+              echo "export CCACHE_BASEDIR=\"$PWD\""
+              echo "export DEVELOPER_DIR=\"$(xcode-select -p)\""
+            } >> "$BASH_ENV"
+            pwd
+            xcode-select -p
+            ls -d /Applications/Xcode*.app
 
-      - name: Install dependencies and configure toolchain
-        command: |
-          brew install jq gum bash cmake ninja ccache
-          # build.sh checks that xcodes binary exists; provide a stub since Xcode is preinstalled
-          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
-          sudo chmod +x /usr/local/bin/xcodes
-          sw_vers
-          xcodebuild -version
-          xcrun --find iig
+      - run:
+          name: Fetch build script
+          command: |
+            git init -q dxb
+            git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+            git -C dxb checkout -q FETCH_HEAD
+            # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
+            cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+            # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
+            sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+            grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+            ls dxb/patches
 
-      - restore_cache:
-          name: Restore ccache
-          keys:
-            - ccache-{{ .Branch }}-<< pipeline.parameters.macos_version >>-<< pipeline.parameters.machine_config >>-<< pipeline.parameters.kernel_config >>-{{ .Revision }}
-            - ccache-{{ .Branch }}-<< pipeline.parameters.macos_version >>-<< pipeline.parameters.machine_config >>-<< pipeline.parameters.kernel_config >>-
-            - ccache-{{ .Branch }}-
+      - run:
+          name: Deps
+          command: |
+            brew install jq gum bash cmake ninja ccache
+            # build.sh only checks that xcodes exists (Xcode is preinstalled)
+            sudo mkdir -p /usr/local/bin
+            printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+            sudo chmod +x /usr/local/bin/xcodes
+            sw_vers
+            xcodebuild -version
+            xcrun --find iig
 
-      - name: Build XNU kernel
-        command: |
-          cd dxb
-          if [ "$USE_CCACHE" = "true" ]; then
-            export CCACHE="$(command -v ccache)"
-            ccache --version | head -1
-            ccache --zero-stats
-          fi
-          if [ "<< pipeline.parameters.keep_going >>" = "true" ]; then
-            export MAKEFLAGS="-k"
-          else
-            export MAKEFLAGS=""
-          fi
-          bash build.sh
+      - when:
+          condition: << pipeline.parameters.use_ccache >>
+          steps:
+            - restore_cache:
+                name: Restore ccache
+                keys:
+                  - ccache-v1-<< pipeline.parameters.macos_version >>-<< pipeline.parameters.machine_config >>-<< pipeline.parameters.kernel_config >>-{{ .Revision }}
+                  - ccache-v1-<< pipeline.parameters.macos_version >>-<< pipeline.parameters.machine_config >>-<< pipeline.parameters.kernel_config >>-
 
-      - name: ccache statistics
-        command: |
-          if [ "$USE_CCACHE" = "true" ]; then
-            ccache --show-stats
-          fi
-        when: always
+      # The build status is recorded instead of failing here, so every later step (ccache save,
+      # packaging, artifacts) still runs after a failed build; the last step fails the job.
+      - run:
+          name: Build
+          working_directory: dxb
+          command: |
+            if [ "$USE_CCACHE" = true ]; then
+              export CCACHE="$(command -v ccache)"
+              ccache --version | head -1
+              ccache --zero-stats
+            fi
+            # keep going after errors so one run reports every compile failure
+            if [ "$KEEP_GOING" = true ]; then export MAKEFLAGS="-k"; else export MAKEFLAGS=""; fi
+            status=0
+            bash build.sh || status=$?
+            echo "$status" > "$HOME/build.status"
+            echo "build.sh exit status: $status"
 
-      - save_cache:
-          name: Save ccache
-          key: ccache-{{ .Branch }}-<< pipeline.parameters.macos_version >>-<< pipeline.parameters.machine_config >>-<< pipeline.parameters.kernel_config >>-{{ .Revision }}
-          paths:
-            - .ccache
+      - when:
+          condition: << pipeline.parameters.use_ccache >>
+          steps:
+            - run:
+                name: ccache statistics
+                when: always
+                command: ccache --show-stats
+            # separate save step so a failed or partial build still keeps what it compiled
+            - save_cache:
+                name: Save ccache
+                when: always
+                key: ccache-v1-<< pipeline.parameters.macos_version >>-<< pipeline.parameters.machine_config >>-<< pipeline.parameters.kernel_config >>-{{ .Revision }}
+                paths:
+                  - .ccache
+
+      - run:
+          name: Package build tree for local compiles
           when: always
+          command: |
+            # Generated headers, config option headers, mig output and the patched
+            # source: enough to re-run any single compile command from the log locally.
+            SDK=$(xcrun --sdk macosx --show-sdk-path)
+            mkdir -p sdk-kernel-platform
+            cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
+            tar czf buildtree.tgz \
+              --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
+              --exclude='kernel.development.*' --exclude='.git' \
+              -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
+              -C .. sdk-kernel-platform
+            ls -la buildtree.tgz
 
-      - name: Package build tree for local compiles
-        command: |
-          SDK=$(xcrun --sdk macosx --show-sdk-path)
-          mkdir -p sdk-kernel-platform
-          cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
-          tar czf buildtree.tgz \
-            --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
-            --exclude='kernel.development.*' --exclude='.git' \
-            -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
-            -C .. sdk-kernel-platform
-          ls -la buildtree.tgz
-        when: always
+      - run:
+          name: Inspect closed KDK support libs
+          when: always
+          command: |
+            mkdir -p out/kdk-libs
+            for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+              b=$(basename "$lib" .a)
+              ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
+              nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
+              lipo -info "$lib" >> out/kdk-libs/arch.txt 2>&1 || true
+            done
+            ls -la out/kdk-libs
 
-      - name: Collect kernel binaries and checksums
-        command: |
-          mkdir -p out
-          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
-          ls -la out
-          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
-        when: always
-
-      - store_artifacts:
-          path: out
-          destination: xnu-kernel
+      - run:
+          name: Collect
+          when: always
+          command: |
+            mkdir -p out
+            cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+            ls -la out
+            (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
       - store_artifacts:
           path: buildtree.tgz
           destination: xnu-buildtree
 
+      - store_artifacts:
+          path: out
+          destination: xnu-kernel
+
+      - run:
+          name: Fail the job if the build failed
+          when: always
+          command: |
+            status=$(cat "$HOME/build.status" 2>/dev/null || echo 1)
+            echo "build status: $status"
+            exit "$status"
+
 workflows:
   build-kernel:
+    # GitHub: `push: branches: [main]` + workflow_dispatch. Here: main, or any API/UI-triggered
+    # pipeline (so a manual run on another branch is not filtered out).
+    when:
+      or:
+        - equal: [main, << pipeline.git.branch >>]
+        - equal: [api, << pipeline.trigger_source >>]
     jobs:
       - build
