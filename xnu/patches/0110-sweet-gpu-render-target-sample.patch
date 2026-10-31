@@ -1,0 +1,89 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c4252bb..f7f589b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -460,8 +460,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 						maintain = NativeAdrenoMaintainOwnedPages((void *)src, (size_t)memLen, NativeAdrenoInvalidate);
+ 					}
+ 				}
+-				IOLog("SWEET FB diag: layer %u present %u nonzero (sampled) plane0 before %u after-invalidate %u, tail before %u after %u, panel %u, invalidate %#x (w %d per row)\n",
+-				    layer, sweet_fb_present_count, nzSrc[0], nzSrc[1], nzTail[0], nzTail[1], nzDst, maintain, w);
++				/* 0109: the physical address the copy reads (compare with "NativeAdrenoVm: GPU wrote ... pa" in NativeAdrenoVm.cpp). */
++				IOByteCount paLen = 0;
++				const uint64_t pa = s->memory->getPhysicalSegment(0, &paLen, kIOMemoryMapperNone);
++				IOLog("SWEET FB diag: layer %u present %u nonzero (sampled) plane0 before %u after-invalidate %u, tail before %u after %u, panel %u, invalidate %#x, pa %#llx (w %d per row)\n",
++				    layer, sweet_fb_present_count, nzSrc[0], nzSrc[1], nzTail[0], nzTail[1], nzDst, maintain, (unsigned long long)pa, w);
+ 			}
+ 		}
+ 		s->release();
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoCpu.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoCpu.cpp
+index 4b5d429..5719185 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoCpu.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoCpu.cpp
+@@ -106,6 +106,19 @@ IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,Native
+     noteMaintenance(began,bytes);
+     return kIOReturnSuccess;
+ }
++uint32_t NativeAdrenoSampleNonzeroWords(uint64_t physical,size_t bytes,size_t stride,uint32_t *sampled)
++{
++    uint32_t nonzero=0,count=0;
++    if(stride && !(stride&3))for(size_t offset=0;offset+4<=bytes;offset+=stride) {
++        const uint64_t address=physical+offset;
++        if(address<gPhysBase || address-gPhysBase>=gPhysSize)continue;   /* phystokv panics outside the kernel's DRAM */
++        const vm_offset_t alias=phystokv(address);
++        if(!alias)continue;
++        ++count;nonzero+=*reinterpret_cast<const volatile uint32_t *>(alias)!=0;
++    }
++    if(sampled)*sampled=count;
++    return nonzero;
++}
+ /* A user BO's pages become Normal non-cacheable (write-combined) for every CPU mapping the pmap tracks: the kernel's own mapping and each
+  * client view. The views did not get the cache mode their mapping asked for (int-070: Turnip's write-combine view left IB words in a CPU
+  * cache line), but they do take the page's own attribute. That is the Linux msm model for its WC BOs: CPU writes reach DRAM, the GPU's
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoMemory.h b/iokit/Kernel/arm/adreno/NativeAdrenoMemory.h
+index 308b9b1..3747550 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoMemory.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoMemory.h
+@@ -17,6 +17,9 @@ IOReturn NativeAdrenoMaintainOwnedPages(void *,size_t,NativeAdrenoCacheOperation
+ /* The same over whole physical pages of DRAM, through the kernel's physical aperture: data cache lines are physically tagged, so this
+  * reaches lines another task's mapping left (an imported IOSurface). Apple's sys_dcache_flush is only a DSB, so user space cannot. */
+ IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,NativeAdrenoCacheOperation);
++/* Diagnostic (0109): counts the non-zero 32-bit words at every `stride` bytes (a multiple of 4) of [physical, physical+bytes) read through the physical
++ * aperture; *sampled is the number of words read. Pages outside the kernel's DRAM are skipped. */
++uint32_t NativeAdrenoSampleNonzeroWords(uint64_t physical,size_t bytes,size_t stride,uint32_t *sampled);
+ /* Every CPU mapping of the spans' pages becomes write-combined (true) or takes the default cacheable attribute again (false). */
+ IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *,size_t count,bool write_combined);
+ /* int-100 found a write-combined BO's page back at the default (cacheable) attribute with dirty IB lines: XNU's view machinery sets a page's
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+index 2e099d9..b1148a2 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -360,6 +360,28 @@ IOReturn NativeAdrenoVm::acquireImported()
+                 (unsigned long long)m.iova,(unsigned long)m.memory->bytes(),(unsigned)acquired);
+             return fail(ArmSmmu4KIoError);
+         }
++        /* NEXT AGENT (0109, diagnostic, remove once the black screen is explained): the GPU wrote this imported surface (a render target) and its
++         * lines were just cleaned and invalidated by acquireDeviceWrites, so reading it through the physical aperture shows what is in DRAM. Count
++         * the non-zero words at every 256th byte (sampled) and print the first span's physical address: AppleCLCD::present logs the same
++         * address for the surface it copies from (SweetFramebuffer.cpp, "pa"), so the two lines show whether the GPU wrote the pages the display
++         * reads, and whether it wrote anything but zeros. Only buffers >= 1 MiB (render targets), the first 64 jobs then every 16th, 200 lines. */
++        if(m.memory->bytes()>=(1u<<20)) {
++            static unsigned seen,reports;
++            ++seen;
++            if(reports<200 && (seen<=64 || seen%16==0)) {
++                ++reports;
++                uint32_t sampled=0,nonzero=0;
++                for(size_t j=0;j<m.memory->spanCount();++j) {
++                    uint32_t part=0;
++                    nonzero+=NativeAdrenoSampleNonzeroWords(m.memory->spans()[j].physical,m.memory->spans()[j].bytes,256,&part);
++                    sampled+=part;
++                }
++                IOLog("NativeAdrenoVm: GPU wrote slot %lu iova 0x%llx pa 0x%llx bytes 0x%lx: %u of %u sampled words non-zero (job %u)\n",
++                    (unsigned long)i,(unsigned long long)m.iova,
++                    (unsigned long long)(m.memory->spanCount()?m.memory->spans()[0].physical:0),(unsigned long)m.memory->bytes(),
++                    nonzero,sampled,seen);
++            }
++        }
+     }
+     return kIOReturnSuccess;
+ }
