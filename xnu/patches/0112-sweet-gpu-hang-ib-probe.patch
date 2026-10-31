@@ -1,0 +1,103 @@
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+index 3306f6d..adb777f 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+@@ -239,6 +239,14 @@ NativeAdrenoRingFence NativeAdrenoRing::observeFence(uint32_t fence,
+         if(clock->idle && clock->idle(clock->cookie))return NativeAdrenoRingFenceTimeout;
+     }
+ }
++bool NativeAdrenoRing::readIb1(uint64_t *base,uint32_t *rem)
++{
++    uint32_t lo=0,hi=0,left=0;
++    if(!attached_ || io_.read32(io_.cookie,0x0928,&lo) || io_.read32(io_.cookie,0x0929,&hi) || io_.read32(io_.cookie,0x092a,&left))return false;
++    if(base)*base=((uint64_t)hi<<32)|lo;
++    if(rem)*rem=left;
++    return true;
++}
+ NativeAdrenoRingFence NativeAdrenoRing::wait(uint32_t fence,const NativeAdrenoRingClock *clock,
+     uint32_t timeout_us,uint32_t *observed)
+ {
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.h b/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
+index 17bbfdb..cb53f9f 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
+@@ -94,6 +94,8 @@ public:
+     uint32_t outstanding() const {return seqno_-completed_;}
+     uint32_t lastSubmitted() const {return seqno_;}      /* the newest fence number handed out */
+     uint32_t completedFence() const {return completed_;}
++    /* Diagnostic (0112): the CP's current IB1 (CP_IB1_BASE 0x928/0x929, CP_IB1_REM_SIZE 0x92a, dwords left). false when a register read failed. */
++    bool readIb1(uint64_t *base,uint32_t *rem);
+     uint32_t submissions() const {return submissions_;}
+     uint32_t readPointer() const {return rptr_shadow_;}
+ };
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+index 7722186..3c697e5 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -260,6 +260,15 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
+     if(result==NativeAdrenoRingFencePoisoned)return poison();
+     if(result==NativeAdrenoRingFenceArgument) {native_adreno_fence_wait[7]=fence;return kIOReturnBadArgument;}
+     if(result==NativeAdrenoRingFenceTimeout) {
++        /* NEXT AGENT (0112, diagnostic): pull8 showed fence 10 never completing with the CP parked inside a nested IB (IB1 base 0x28ca0000,
++         * 0xabc dwords left) while the main ring was fully consumed. On the 3rd, 2049th and 16385th timeout of the process, ask whether that
++         * IB1 base is a mapped BO of this context (an unmapped one = an SMMU fault this driver cannot see) and dump its first dwords. */
++        static unsigned stuck;
++        const unsigned seen=stuck++;
++        if(seen==3 || seen==2048 || seen==16384) {
++            uint64_t base=0;uint32_t left=0;
++            if(ring_->readIb1(&base,&left))vm_->probeIova(base,left);
++        }
+         ++stats_.timeouts;
+         native_adreno_fence_wait[1]=native_adreno_fence_wait[1]+1;native_adreno_fence_wait[2]=fence;native_adreno_fence_wait[3]=observed;
+         native_adreno_fence_wait[4]=ring_->lastSubmitted();native_adreno_fence_wait[5]=ring_->completedFence();
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+index b1148a2..cae2277 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -385,6 +385,31 @@ IOReturn NativeAdrenoVm::acquireImported()
+     }
+     return kIOReturnSuccess;
+ }
++void NativeAdrenoVm::probeIova(uint64_t iova,uint32_t rem) const
++{
++    if(!attached_)return;
++    const Mapping *below=nullptr,*above=nullptr;
++    for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
++        const Mapping &m=mappings_[i];
++        if(!m.memory)continue;
++        const uint64_t bytes=m.memory->bytes();
++        if(iova>=m.iova && iova-m.iova<bytes) {
++            const uint64_t offset=iova-m.iova;
++            uint32_t w[8]={};unsigned have=0;
++            if(const volatile uint32_t *cpu=static_cast<const volatile uint32_t *>(m.memory->mapping()))
++                for(;have<8 && (offset+4*(have+1))<=bytes;++have)w[have]=cpu[offset/4+have];
++            IOLog("NativeAdrenoVm: IB probe iova 0x%llx rem 0x%x: slot %lu BO iova 0x%llx bytes 0x%llx perms %u imported %d offset 0x%llx; first %u dwords %08x %08x %08x %08x %08x %08x %08x %08x\n",
++                (unsigned long long)iova,rem,(unsigned long)i,(unsigned long long)m.iova,(unsigned long long)bytes,m.permissions,(int)m.memory->imported(),
++                (unsigned long long)offset,have,w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7]);
++            return;
++        }
++        if(m.iova<=iova && (!below || m.iova>below->iova))below=&m;
++        if(m.iova>iova && (!above || m.iova<above->iova))above=&m;
++    }
++    IOLog("NativeAdrenoVm: IB probe iova 0x%llx rem 0x%x: NOT MAPPED in this context; nearest below 0x%llx+0x%llx, nearest above 0x%llx\n",
++        (unsigned long long)iova,rem,(unsigned long long)(below?below->iova:0),(unsigned long long)(below?below->memory->bytes():0),
++        (unsigned long long)(above?above->iova:0));
++}
+ IOReturn NativeAdrenoVm::sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dram) const
+ {
+     if(!cached || !dram)return kIOReturnBadArgument;
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+index c82544d..6fb5a41 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+@@ -101,6 +101,10 @@ public:
+     /* Diagnostic, never a proof of coherence: the 32-bit word at a mapped GPU address as the kernel's cacheable alias reads it
+      * and, when the board installed native_adreno_dram_read32, as DRAM reads it through an uncached mapping (else ~0). */
+     IOReturn sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dram) const;
++    /* Diagnostic (0112), for a fence that never completes: says whether the CP's current IB1 base lies inside a BO this context maps (an
++     * unmapped IB would be an SMMU translation fault, which this driver cannot see), and dumps the first dwords of that IB through the BO's
++     * kernel mapping when it has one. `rem` is CP_IB1_REM_SIZE as read. */
++    void probeIova(uint64_t iova,uint32_t rem) const;
+     /* Every line of [iova, iova+bytes) that lies in a write-combined BO, through native_adreno_line_audit: *dirty counts lines a CPU
+      * cache held newer than DRAM (a client view that caches after all; each such line is written back by the audit), *stale clean
+      * copies, *lines the lines compared. kIOReturnUnsupported without a board hook. int-099 sampled one word and wrote its line back
