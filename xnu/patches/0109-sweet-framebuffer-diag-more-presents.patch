@@ -1,0 +1,22 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index dea13d5..c4252bb 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -391,12 +391,13 @@ AppleCLCD::present(const uint8_t *rec)
+ 		 * first swaps, name the guard that stops the copy, and count non-zero words in the source and the panel after the copy, sampled
+ 		 * every 97th row. A copy that happens with non-zero source words but a black panel points at the cache or the scanout; a zero
+ 		 * source points at the renderer. */
+-		/* 0108: report the first 4 presents, then every 64th (the first 16 only ever showed an all-zero source, which a legitimately black
+-		 * first frame explains), at most 40 reports. */
+-		static unsigned sweet_fb_diag_budget = 40;
++		/* 0108: report the first presents, then every Nth, at most 120 reports. 0109: 0108 reported presents 1-4 and every 64th, but a
++		 * booted SpringBoard only reaches ~45 presents in 3-5 minutes (the UI is static), so the 64th never came and only the first four
++		 * (all-zero, possibly legitimately black) frames were seen. Report the first 80 presents, then every 32nd. */
++		static unsigned sweet_fb_diag_budget = 120;
+ 		static unsigned sweet_fb_present_count;
+ 		sweet_fb_present_count++;
+-		const bool diag = sweet_fb_diag_budget > 0 && (sweet_fb_present_count <= 4 || (sweet_fb_present_count % 64) == 0);
++		const bool diag = sweet_fb_diag_budget > 0 && (sweet_fb_present_count <= 80 || (sweet_fb_present_count % 32) == 0);
+ 		if (diag) {
+ 			sweet_fb_diag_budget--;
+ 		}
