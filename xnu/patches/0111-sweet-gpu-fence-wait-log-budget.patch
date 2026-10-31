@@ -1,0 +1,46 @@
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+index 981ba9c..3306f6d 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+@@ -246,7 +246,13 @@ NativeAdrenoRingFence NativeAdrenoRing::wait(uint32_t fence,const NativeAdrenoRi
+     if(!attached_ || poisoned_)return NativeAdrenoRingFencePoisoned;
+     if(!fence || fence>seqno_)return NativeAdrenoRingFenceArgument;
+     uint64_t start=clock && clock->now_us?clock->now_us(clock->cookie):0;
+-    ring_mark("wait begin");
++    /* NEXT AGENT (0111): userland polls this wait (timeout 0 => an immediate NativeAdrenoRingFenceTimeout) and every poll used to log two lines and
++     * force a UFS flush (ring_mark -> sweet_log_sync). A fence that does not complete (pull6.txt) therefore wrote ~70,000 poll pairs, wrapped the 4 MiB
++     * persistent ring and hid everything else, besides slowing the polling itself. Now the first 16 polls are marked, then every 1024th; the counters
++     * are plain statics (diagnostic only, a race merely skips or repeats a line). */
++    static uint32_t polls;
++    const uint32_t poll=polls++;
++    if(poll<16 || !(poll&1023))ring_mark("wait begin");
+     for(;;) {
+         if(cache_.acquire(cache_.cookie,fence_,fence_bytes_)) {poison();return NativeAdrenoRingFencePoisoned;}
+         const uint32_t value=fence_[1];
+@@ -257,18 +263,20 @@ NativeAdrenoRingFence NativeAdrenoRing::wait(uint32_t fence,const NativeAdrenoRi
+             return NativeAdrenoRingFenceComplete;}
+         if(!clock || !clock->now_us)return NativeAdrenoRingFenceTimeout;
+         if(clock->now_us(clock->cookie)-start>=timeout_us) {
+-            ring_mark("wait timeout");
++            static uint32_t timeouts;
++            const uint32_t late=timeouts++;
++            if(late<16 || !(late&1023))ring_mark("wait timeout");
+             /* Bring-up: where the CP stands when a fence is late. Register indices (dwords) from a6xx.xml: RBBM_INT_0_STATUS 0x201,
+              * RBBM_STATUS 0x210, RBBM_STATUS1 0x211, CP_HW_FAULT 0x821, CP_STATUS_1 0x825, CP_IB1_BASE 0x928 (64 bit), CP_IB1_REM_SIZE 0x92a.
+              * Plain reads; a failed read leaves the all-ones marker. */
+-            static uint32_t budget=6;
+-            if(budget) {
+-                --budget;
++            /* 0111: the first 6 late fences, then every 2048th, each with its running count, so a fence that never completes shows whether the CP
++             * still advances (rptr, ib1 rem, status) over time instead of one early snapshot. */
++            if(late<6 || !(late&2047)) {
+                 uint32_t r[9];for(unsigned i=0;i<9;++i)r[i]=0xffffffffu;
+                 static const uint32_t regs[9]={RingRptr,0x0201,0x0210,0x0211,0x0821,0x0825,0x0928,0x0929,0x092a};
+                 for(unsigned i=0;i<9;++i){uint32_t v=0;if(!io_.read32(io_.cookie,regs[i],&v))r[i]=v;}
+-                IOLog("NativeAdrenoRing: late fence %u: memptrs [%08x %08x %08x %08x] newest %u next %u | rptr %u int0 %08x status %08x status1 %08x hwfault %08x cpstat1 %08x ib1 %08x%08x rem %08x\n",
+-                    fence,fence_[0],fence_[1],fence_[2],fence_[3],seqno_,next_,r[0],r[1],r[2],r[3],r[4],r[5],r[7],r[6],r[8]);
++                IOLog("NativeAdrenoRing: late fence #%u %u: memptrs [%08x %08x %08x %08x] newest %u next %u | rptr %u int0 %08x status %08x status1 %08x hwfault %08x cpstat1 %08x ib1 %08x%08x rem %08x\n",
++                    late,fence,fence_[0],fence_[1],fence_[2],fence_[3],seqno_,next_,r[0],r[1],r[2],r[3],r[4],r[5],r[7],r[6],r[8]);
+             }
+             return NativeAdrenoRingFenceTimeout;
+         }
