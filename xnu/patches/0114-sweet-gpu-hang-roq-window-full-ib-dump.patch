@@ -1,0 +1,102 @@
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+index 1907e83..7cc2349 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+@@ -239,14 +239,17 @@ NativeAdrenoRingFence NativeAdrenoRing::observeFence(uint32_t fence,
+         if(clock->idle && clock->idle(clock->cookie))return NativeAdrenoRingFenceTimeout;
+     }
+ }
+-bool NativeAdrenoRing::readIb1(uint64_t *base,uint32_t *rem,uint32_t *initSize)
++bool NativeAdrenoRing::readIb1(uint64_t *base,uint32_t *rem,uint32_t *initSize,uint32_t *roqRem)
+ {
+-    uint32_t lo=0,hi=0,left=0,init=0;
++    uint32_t lo=0,hi=0,left=0,init=0,roq=0;
+     if(!attached_ || io_.read32(io_.cookie,0x0928,&lo) || io_.read32(io_.cookie,0x0929,&hi) || io_.read32(io_.cookie,0x092a,&left))return false;
+     if(initSize && io_.read32(io_.cookie,0x0943,&init))init=0;   /* CP_IB1_INIT_SIZE; 0 = unreadable */
+     if(base)*base=((uint64_t)hi<<32)|lo;
+     if(rem)*rem=left;
+     if(initSize)*initSize=init;
++    /* 0114: CP_ROQ_AVAIL_IB1 (0x949) REM = bits 31:16 = dwords already fetched into the CP's queue but not yet consumed (mainline a6xx.xml). The CP is
++     * executing near (init-rem)-REM, not at init-rem: pull10 stood at 992 taken with REM 243, so the stalled packet is near dword 749. */
++    if(roqRem && !io_.read32(io_.cookie,0x0949,&roq))*roqRem=roq>>16;
+     return true;
+ }
+ NativeAdrenoRingFence NativeAdrenoRing::wait(uint32_t fence,const NativeAdrenoRingClock *clock,
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.h b/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
+index fc1442c..7d41589 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
+@@ -95,7 +95,7 @@ public:
+     uint32_t lastSubmitted() const {return seqno_;}      /* the newest fence number handed out */
+     uint32_t completedFence() const {return completed_;}
+     /* Diagnostic (0112): the CP's current IB1 (CP_IB1_BASE 0x928/0x929, CP_IB1_REM_SIZE 0x92a, dwords left). false when a register read failed. */
+-    bool readIb1(uint64_t *base,uint32_t *rem,uint32_t *initSize=nullptr);   /* 0113: initSize = CP_IB1_INIT_SIZE (0x943) */
++    bool readIb1(uint64_t *base,uint32_t *rem,uint32_t *initSize=nullptr,uint32_t *roqRem=nullptr);   /* 0113: initSize = CP_IB1_INIT_SIZE (0x943) */
+     uint32_t submissions() const {return submissions_;}
+     uint32_t readPointer() const {return rptr_shadow_;}
+ };
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+index 5f27f0d..cc2db74 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -282,9 +282,9 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
+         static unsigned stuck;
+         const unsigned seen=stuck++;
+         if(seen==3 || seen==2048 || seen==16384) {
+-            uint64_t base=0;uint32_t left=0,init=0;
+-            if(ring_->readIb1(&base,&left,&init)) {
+-                vm_->probeIova(base,left,init);
++            uint64_t base=0;uint32_t left=0,init=0,roq=0;
++            if(ring_->readIb1(&base,&left,&init,&roq)) {
++                vm_->probeIova(base,left,init,roq,seen==3);
+                 for(unsigned i=0;i<lastIbs_.count;++i)   /* 0113: which IB of the newest submission contains the CP's IB1 base */
+                     if(base>=lastIbs_.iova[i] && base-lastIbs_.iova[i]<lastIbs_.bytes[i])
+                         IOLog("NativeAdrenoSubmit: hang probe: IB1 base 0x%llx is IB[%u/%u] of fence %u (iova 0x%llx bytes 0x%llx)\n",(unsigned long long)base,i,lastIbs_.count,
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+index ea83877..3524981 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -385,7 +385,7 @@ IOReturn NativeAdrenoVm::acquireImported()
+     }
+     return kIOReturnSuccess;
+ }
+-void NativeAdrenoVm::probeIova(uint64_t iova,uint32_t rem,uint32_t initSize) const
++void NativeAdrenoVm::probeIova(uint64_t iova,uint32_t rem,uint32_t initSize,uint32_t roqRem,bool dumpAll) const
+ {
+     if(!attached_)return;
+     const Mapping *below=nullptr,*above=nullptr;
+@@ -418,6 +418,21 @@ void NativeAdrenoVm::probeIova(uint64_t iova,uint32_t rem,uint32_t initSize) con
+                     }
+                     IOLog("NativeAdrenoVm:   [dw %4llu] %08x %08x %08x %08x %08x %08x %08x %08x\n",(unsigned long long)(startDw+line*8),v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7]);
+                 }
++                /* NEXT AGENT (0114): pull10 showed the true execution point lags the fetch point by CP_ROQ_AVAIL_IB1.REM dwords, so the 24-dword window
++                 * above misses the stalled packet. Window of 64 dwords starting 32 before (taken - roqRem), and, once, the whole IB (CPU view of the BO,
++                 * at most 4096 dwords) to decode offline (packet walk, WAIT_* packets, addresses). */
++                const uint64_t consumed=taken>roqRem?taken-roqRem:0;
++                const uint64_t from=consumed>32?consumed-32:0;
++                IOLog("NativeAdrenoVm: IB probe execution estimate: taken %llu - roq rem %u = dword %llu; window %llu..%llu\n",(unsigned long long)taken,roqRem,
++                    (unsigned long long)consumed,(unsigned long long)from,(unsigned long long)from+63);
++                const volatile uint32_t *cpu=static_cast<const volatile uint32_t *>(m.memory->mapping());
++                const uint64_t last=dumpAll?(initSize<4096?initSize:4096):from+64;
++                const uint64_t begin=dumpAll?0:from;
++                for(uint64_t dw=begin;dw<last;dw+=8) {
++                    uint32_t v[8]={};
++                    for(unsigned k=0;k<8;++k) {const uint64_t at=offset+4*(dw+k);if(cpu && dw+k<initSize && at+4<=bytes)v[k]=cpu[at/4];}
++                    IOLog("NativeAdrenoVm:   %s[dw %4llu] %08x %08x %08x %08x %08x %08x %08x %08x\n",dumpAll?"full ":"win ",(unsigned long long)dw,v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7]);
++                }
+             }
+             return;
+         }
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+index 8490756..2d28e86 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+@@ -104,7 +104,7 @@ public:
+     /* Diagnostic (0112), for a fence that never completes: says whether the CP's current IB1 base lies inside a BO this context maps (an
+      * unmapped IB would be an SMMU translation fault, which this driver cannot see), and dumps the first dwords of that IB through the BO's
+      * kernel mapping when it has one. `rem` is CP_IB1_REM_SIZE as read. */
+-    void probeIova(uint64_t iova,uint32_t rem,uint32_t initSize=0) const;   /* 0113: initSize from CP_IB1_INIT_SIZE, 0 = unknown */
++    void probeIova(uint64_t iova,uint32_t rem,uint32_t initSize=0,uint32_t roqRem=0,bool dumpAll=false) const;   /* 0113: initSize from CP_IB1_INIT_SIZE, 0 = unknown */
+     /* Every line of [iova, iova+bytes) that lies in a write-combined BO, through native_adreno_line_audit: *dirty counts lines a CPU
+      * cache held newer than DRAM (a client view that caches after all; each such line is written back by the audit), *stale clean
+      * copies, *lines the lines compared. kIOReturnUnsupported without a board hook. int-099 sampled one word and wrote its line back
