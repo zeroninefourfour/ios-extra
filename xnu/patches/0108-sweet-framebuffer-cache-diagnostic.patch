@@ -1,0 +1,70 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index aae8d61..dea13d5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -35,6 +35,7 @@
+  * the first swap on (it still reaches the persistent log; panics draw).
+  */
+ #include "SweetSurface.h"
++#include "adreno/NativeAdrenoMemory.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ 
+@@ -390,8 +391,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 		 * first swaps, name the guard that stops the copy, and count non-zero words in the source and the panel after the copy, sampled
+ 		 * every 97th row. A copy that happens with non-zero source words but a black panel points at the cache or the scanout; a zero
+ 		 * source points at the renderer. */
+-		static unsigned sweet_fb_diag_budget = 16;
+-		const bool diag = sweet_fb_diag_budget > 0;
++		/* 0108: report the first 4 presents, then every 64th (the first 16 only ever showed an all-zero source, which a legitimately black
++		 * first frame explains), at most 40 reports. */
++		static unsigned sweet_fb_diag_budget = 40;
++		static unsigned sweet_fb_present_count;
++		sweet_fb_present_count++;
++		const bool diag = sweet_fb_diag_budget > 0 && (sweet_fb_present_count <= 4 || (sweet_fb_present_count % 64) == 0);
+ 		if (diag) {
+ 			sweet_fb_diag_budget--;
+ 		}
+@@ -424,16 +429,38 @@ AppleCLCD::present(const uint8_t *rec)
+ 				    (size_t)w * 4);
+ 			}
+ 			if (diag) {
+-				uint32_t nzSrc = 0, nzDst = 0;
++				/* NEXT AGENT (0108): "src" is plane 0 of the surface (sampled rows); "tail" is what follows plane 0 (a 'b3a8' surface has a
++				 * second, alpha, plane there; sampled every 16th word), so a black RGB plane with live alpha shows up. The source is counted
++				 * as the copy saw it ("before"), then its cache lines are invalidated (dc ivac over the whole kernel mapping, whole pages, as
++				 * NativeAdrenoMaintainOwnedPages does for BOs) and counted again ("after"): non-zero after but zero before means the CPU was
++				 * reading stale cache lines of memory the GPU wrote (the display copy then needs the same maintenance before it reads).
++				 * DIAGNOSTIC ONLY: the invalidate also drops dirty CPU-written lines of this surface; remove with the rest of this diag. */
++				const uint64_t planeEnd = (uint64_t)s->offset + (uint64_t)s->height * s->bytesPerRow;
++				const uint64_t memLen = s->memory->getLength();
++				uint32_t nzDst = 0, nzSrc[2] = {0, 0}, nzTail[2] = {0, 0};
+ 				for (int32_t y = 0; y < h; y += 97) {
+-					const uint32_t *ps = (const uint32_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4);
+ 					const uint32_t *pd = (const uint32_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4);
+ 					for (int32_t x = 0; x < w; x++) {
+-						nzSrc += ps[x] != 0;
+ 						nzDst += pd[x] != 0;
+ 					}
+ 				}
+-				IOLog("SWEET FB diag: layer %u nonzero words (sampled rows) src %u dst %u of %d per row\n", layer, nzSrc, nzDst, w);
++				IOReturn maintain = kIOReturnUnsupported;
++				for (int pass = 0; pass < 2; pass++) {
++					for (int32_t y = 0; y < h; y += 97) {
++						const uint32_t *ps = (const uint32_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4);
++						for (int32_t x = 0; x < w; x++) {
++							nzSrc[pass] += ps[x] != 0;
++						}
++					}
++					for (uint64_t o = planeEnd; o + 4 <= memLen; o += 64) {
++						nzTail[pass] += *(const uint32_t *)(src + o) != 0;
++					}
++					if (pass == 0 && ((src | memLen) & 4095) == 0) {
++						maintain = NativeAdrenoMaintainOwnedPages((void *)src, (size_t)memLen, NativeAdrenoInvalidate);
++					}
++				}
++				IOLog("SWEET FB diag: layer %u present %u nonzero (sampled) plane0 before %u after-invalidate %u, tail before %u after %u, panel %u, invalidate %#x (w %d per row)\n",
++				    layer, sweet_fb_present_count, nzSrc[0], nzSrc[1], nzTail[0], nzTail[1], nzDst, maintain, w);
+ 			}
+ 		}
+ 		s->release();
