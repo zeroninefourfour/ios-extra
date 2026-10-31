@@ -1,0 +1,158 @@
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+index adb777f..1907e83 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+@@ -239,12 +239,14 @@ NativeAdrenoRingFence NativeAdrenoRing::observeFence(uint32_t fence,
+         if(clock->idle && clock->idle(clock->cookie))return NativeAdrenoRingFenceTimeout;
+     }
+ }
+-bool NativeAdrenoRing::readIb1(uint64_t *base,uint32_t *rem)
++bool NativeAdrenoRing::readIb1(uint64_t *base,uint32_t *rem,uint32_t *initSize)
+ {
+-    uint32_t lo=0,hi=0,left=0;
++    uint32_t lo=0,hi=0,left=0,init=0;
+     if(!attached_ || io_.read32(io_.cookie,0x0928,&lo) || io_.read32(io_.cookie,0x0929,&hi) || io_.read32(io_.cookie,0x092a,&left))return false;
++    if(initSize && io_.read32(io_.cookie,0x0943,&init))init=0;   /* CP_IB1_INIT_SIZE; 0 = unreadable */
+     if(base)*base=((uint64_t)hi<<32)|lo;
+     if(rem)*rem=left;
++    if(initSize)*initSize=init;
+     return true;
+ }
+ NativeAdrenoRingFence NativeAdrenoRing::wait(uint32_t fence,const NativeAdrenoRingClock *clock,
+@@ -285,6 +287,15 @@ NativeAdrenoRingFence NativeAdrenoRing::wait(uint32_t fence,const NativeAdrenoRi
+                 for(unsigned i=0;i<9;++i){uint32_t v=0;if(!io_.read32(io_.cookie,regs[i],&v))r[i]=v;}
+                 IOLog("NativeAdrenoRing: late fence #%u %u: memptrs [%08x %08x %08x %08x] newest %u next %u | rptr %u int0 %08x status %08x status1 %08x hwfault %08x cpstat1 %08x ib1 %08x%08x rem %08x\n",
+                     late,fence,fence_[0],fence_[1],fence_[2],fence_[3],seqno_,next_,r[0],r[1],r[2],r[3],r[4],r[5],r[7],r[6],r[8]);
++                /* NEXT AGENT (0113, diagnostic): pull9 left two questions the line above cannot answer. RBBM_STATUS3 bit 24 = SMMU_STALLED_ON_FAULT
++                 * (a stalled GPU translation fault, invisible otherwise because this driver has no SMMU register access); CP_IB1_INIT_SIZE (0x943) is the
++                 * IB's total dword count, so init-rem = dwords the CP has taken; IB2 (0x92b/0x92c base, 0x92d rem) shows a nested call; CP_PROTECT_STATUS
++                 * (0x824) a blocked register write; CP_ROQ_AVAIL_IB1/IB2 (0x949/0x94a) how much the CP has prefetched. Offsets from mainline a6xx.xml. */
++                uint32_t x[9];for(unsigned i=0;i<9;++i)x[i]=0xffffffffu;
++                static const uint32_t xregs[9]={0x0212,0x0213,0x0943,0x092b,0x092c,0x092d,0x0824,0x0949,0x094a};
++                for(unsigned i=0;i<9;++i){uint32_t v=0;if(!io_.read32(io_.cookie,xregs[i],&v))x[i]=v;}
++                IOLog("NativeAdrenoRing: late fence #%u extra: status2 %08x status3 %08x (smmu-stalled %u) ib1 init %08x ib2 %08x%08x rem %08x protect %08x roq-ib1 %08x roq-ib2 %08x\n",
++                    late,x[0],x[1],(x[1]>>24)&1,x[2],x[4],x[3],x[5],x[6],x[7],x[8]);
+             }
+             return NativeAdrenoRingFenceTimeout;
+         }
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.h b/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
+index cb53f9f..fc1442c 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
+@@ -95,7 +95,7 @@ public:
+     uint32_t lastSubmitted() const {return seqno_;}      /* the newest fence number handed out */
+     uint32_t completedFence() const {return completed_;}
+     /* Diagnostic (0112): the CP's current IB1 (CP_IB1_BASE 0x928/0x929, CP_IB1_REM_SIZE 0x92a, dwords left). false when a register read failed. */
+-    bool readIb1(uint64_t *base,uint32_t *rem);
++    bool readIb1(uint64_t *base,uint32_t *rem,uint32_t *initSize=nullptr);   /* 0113: initSize = CP_IB1_INIT_SIZE (0x943) */
+     uint32_t submissions() const {return submissions_;}
+     uint32_t readPointer() const {return rptr_shadow_;}
+ };
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+index 3c697e5..5f27f0d 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -190,6 +190,22 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
+         for(unsigned i=0;i<28;++i)native_adreno_ib_log[slot][4+i]=head[i];
+         native_adreno_ib_log_count=native_adreno_ib_log_count+1;
+     }
++    {
++        /* NEXT AGENT (0113, diagnostic): pull9 hung inside an IB (0x68068000) that was not buffers[0] (0x68088000) of the 5-IB submission, and only
++         * buffers[0] is ever dumped. Remember every IB of the newest submission (iova, bytes) so the hang probe can say which one the CP is in, and
++         * dump the head of every IB for the first two submissions with 4 or more IBs (the failing job had 5, the working ones 1-3). */
++        lastIbs_.fence=ring_->lastSubmitted()+1;lastIbs_.count=count<8?(unsigned)count:8;
++        for(unsigned i=0;i<lastIbs_.count;++i){lastIbs_.iova[i]=buffers[i].iova;lastIbs_.bytes[i]=buffers[i].bytes;}
++        static uint32_t bigBudget=2;
++        if(count>=4 && bigBudget) {
++            --bigBudget;
++            for(unsigned i=0;i<lastIbs_.count;++i) {
++                uint32_t h[8]={0};(void)vm_->peekWords(buffers[i].iova,h,8);
++                IOLog("NativeAdrenoSubmit: big job fence %u IB[%u/%lu] iova 0x%llx bytes 0x%llx: %08x %08x %08x %08x %08x %08x %08x %08x\n",lastIbs_.fence,i,(unsigned long)count,
++                    (unsigned long long)buffers[i].iova,(unsigned long long)buffers[i].bytes,h[0],h[1],h[2],h[3],h[4],h[5],h[6],h[7]);
++            }
++        }
++    }
+     {
+         /* Bring-up: the first IB's head as the kernel reads it through the GPU mapping (first submissions only). */
+         static uint32_t budget=6;
+@@ -266,8 +282,14 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
+         static unsigned stuck;
+         const unsigned seen=stuck++;
+         if(seen==3 || seen==2048 || seen==16384) {
+-            uint64_t base=0;uint32_t left=0;
+-            if(ring_->readIb1(&base,&left))vm_->probeIova(base,left);
++            uint64_t base=0;uint32_t left=0,init=0;
++            if(ring_->readIb1(&base,&left,&init)) {
++                vm_->probeIova(base,left,init);
++                for(unsigned i=0;i<lastIbs_.count;++i)   /* 0113: which IB of the newest submission contains the CP's IB1 base */
++                    if(base>=lastIbs_.iova[i] && base-lastIbs_.iova[i]<lastIbs_.bytes[i])
++                        IOLog("NativeAdrenoSubmit: hang probe: IB1 base 0x%llx is IB[%u/%u] of fence %u (iova 0x%llx bytes 0x%llx)\n",(unsigned long long)base,i,lastIbs_.count,
++                            lastIbs_.fence,(unsigned long long)lastIbs_.iova[i],(unsigned long long)lastIbs_.bytes[i]);
++            }
+         }
+         ++stats_.timeouts;
+         native_adreno_fence_wait[1]=native_adreno_fence_wait[1]+1;native_adreno_fence_wait[2]=fence;native_adreno_fence_wait[3]=observed;
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.h b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.h
+index 6e99aff..78f19e0 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.h
+@@ -40,6 +40,8 @@ class NativeAdrenoSubmit final {
+     NativeAdrenoVm *vm_=nullptr;
+     NativeAdrenoRing *ring_=nullptr;
+     NativeAdrenoSubmitStats stats_{};
++    /* NEXT AGENT (0113, diagnostic): the IB list of the newest submission, for the hang probe in wait(). */
++    struct {uint32_t fence=0;unsigned count=0;uint64_t iova[8]={},bytes[8]={};} lastIbs_;
+     bool attached_=false,poisoned_=false;
+     uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */
+     Job *find(uint32_t fence);
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+index cae2277..ea83877 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -385,7 +385,7 @@ IOReturn NativeAdrenoVm::acquireImported()
+     }
+     return kIOReturnSuccess;
+ }
+-void NativeAdrenoVm::probeIova(uint64_t iova,uint32_t rem) const
++void NativeAdrenoVm::probeIova(uint64_t iova,uint32_t rem,uint32_t initSize) const
+ {
+     if(!attached_)return;
+     const Mapping *below=nullptr,*above=nullptr;
+@@ -401,6 +401,24 @@ void NativeAdrenoVm::probeIova(uint64_t iova,uint32_t rem) const
+             IOLog("NativeAdrenoVm: IB probe iova 0x%llx rem 0x%x: slot %lu BO iova 0x%llx bytes 0x%llx perms %u imported %d offset 0x%llx; first %u dwords %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                 (unsigned long long)iova,rem,(unsigned long)i,(unsigned long long)m.iova,(unsigned long long)bytes,m.permissions,(int)m.memory->imported(),
+                 (unsigned long long)offset,have,w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7]);
++            /* NEXT AGENT (0113): if CP_IB1_INIT_SIZE was readable and larger than rem, the CP has taken (init-rem) dwords of this IB; dump 24 dwords
++             * from 8 before that point (prefetch may let the real execution point be earlier: compare with the roq-ib1 value of the late fence line).
++             * Whether rem counts executed or fetched dwords is NOT verified on this GPU. */
++            if(initSize && initSize>=rem) {
++                const uint64_t taken=initSize-rem;
++                const uint64_t startDw=taken>8?taken-8:0;
++                IOLog("NativeAdrenoVm: IB probe taken %llu of %u dwords; dwords %llu..%llu of the IB (the CP stands near dword %llu):\n",
++                    (unsigned long long)taken,initSize,(unsigned long long)startDw,(unsigned long long)startDw+23,(unsigned long long)taken);
++                for(unsigned line=0;line<3;++line) {
++                    uint32_t v[8]={};
++                    const volatile uint32_t *cpu=static_cast<const volatile uint32_t *>(m.memory->mapping());
++                    for(unsigned k=0;k<8;++k) {
++                        const uint64_t at=offset+4*(startDw+line*8+k);
++                        if(cpu && at+4<=bytes)v[k]=cpu[at/4];
++                    }
++                    IOLog("NativeAdrenoVm:   [dw %4llu] %08x %08x %08x %08x %08x %08x %08x %08x\n",(unsigned long long)(startDw+line*8),v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7]);
++                }
++            }
+             return;
+         }
+         if(m.iova<=iova && (!below || m.iova>below->iova))below=&m;
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+index 6fb5a41..8490756 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+@@ -104,7 +104,7 @@ public:
+     /* Diagnostic (0112), for a fence that never completes: says whether the CP's current IB1 base lies inside a BO this context maps (an
+      * unmapped IB would be an SMMU translation fault, which this driver cannot see), and dumps the first dwords of that IB through the BO's
+      * kernel mapping when it has one. `rem` is CP_IB1_REM_SIZE as read. */
+-    void probeIova(uint64_t iova,uint32_t rem) const;
++    void probeIova(uint64_t iova,uint32_t rem,uint32_t initSize=0) const;   /* 0113: initSize from CP_IB1_INIT_SIZE, 0 = unknown */
+     /* Every line of [iova, iova+bytes) that lies in a write-combined BO, through native_adreno_line_audit: *dirty counts lines a CPU
+      * cache held newer than DRAM (a client view that caches after all; each such line is written back by the audit), *stale clean
+      * copies, *lines the lines compared. kIOReturnUnsupported without a board hook. int-099 sampled one word and wrote its line back
