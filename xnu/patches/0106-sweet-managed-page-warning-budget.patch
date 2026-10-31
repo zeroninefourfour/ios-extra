@@ -1,0 +1,27 @@
+diff --git a/iokit/Kernel/IOMemoryDescriptor.cpp b/iokit/Kernel/IOMemoryDescriptor.cpp
+index 4d96763..e658575 100644
+--- a/iokit/Kernel/IOMemoryDescriptor.cpp
++++ b/iokit/Kernel/IOMemoryDescriptor.cpp
+@@ -5192,10 +5192,19 @@ IOMemoryDescriptor::populateDevicePager(
+ 		}
+ 
+ #if DEBUG || DEVELOPMENT
+-		if ((kIOMemoryTypeUPL != type)
++		/* sweet: this is only a warning (DEBUG/DEVELOPMENT). The GPU's BO views map physical RAM on every CPU map, so it fired ~88k
++		 * times per boot with a backtrace each, filling the 4 MiB persistent log in seconds and pushing out the panic evidence.
++		 * A few reports are kept as proof that it happens; NEXT AGENT: do not raise this budget without a reason. */
++		static unsigned sweet_managed_page_reports = 8;
++		if ((kIOMemoryTypeUPL != type) && sweet_managed_page_reports
+ 		    && pmap_has_managed_page((ppnum_t) atop_64(physAddr), (ppnum_t) atop_64(physAddr + segLen - 1))) {
+-			OSReportWithBacktrace("IOMemoryDescriptor physical with managed page 0x%qx:0x%qx",
+-			    physAddr, (uint64_t)segLen);
++			if (--sweet_managed_page_reports == 0) {
++				OSReportWithBacktrace("IOMemoryDescriptor physical with managed page 0x%qx:0x%qx (further reports suppressed)",
++				    physAddr, (uint64_t)segLen);
++			} else {
++				OSReportWithBacktrace("IOMemoryDescriptor physical with managed page 0x%qx:0x%qx",
++				    physAddr, (uint64_t)segLen);
++			}
+ 		}
+ #endif /* DEBUG || DEVELOPMENT */
+ 
