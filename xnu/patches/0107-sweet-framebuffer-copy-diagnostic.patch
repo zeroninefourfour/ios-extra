@@ -1,0 +1,60 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c7f2f48..aae8d61 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -386,16 +386,55 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
++		/* sweet diag (NEXT AGENT: remove once the black screen is explained): the guards below return nothing and log nothing. For the
++		 * first swaps, name the guard that stops the copy, and count non-zero words in the source and the panel after the copy, sampled
++		 * every 97th row. A copy that happens with non-zero source words but a black panel points at the cache or the scanout; a zero
++		 * source points at the renderer. */
++		static unsigned sweet_fb_diag_budget = 16;
++		const bool diag = sweet_fb_diag_budget > 0;
++		if (diag) {
++			sweet_fb_diag_budget--;
++		}
++		const char *why = NULL;
++		if (w <= 0 || h <= 0) {
++			why = "empty rect";
++		} else if (s->elementWidth != 1 || s->elementHeight != 1) {
++			why = "element size";
++		} else if (s->memory == NULL) {
++			why = "no memory";
++		} else if (last > s->memory->getLength()) {
++			why = "range";
++		} else if (bpe != 4) {
++			why = "bpe";
++		}
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
++		if (diag) {
++			IOLog("SWEET FB diag: layer %u surface %u ew %u eh %u bpe %u mem %d last %llu len %llu w %d h %d dst %d,%d guard %s\n",
++			    layer, id, s->elementWidth, s->elementHeight, bpe, s->memory != NULL,
++			    (unsigned long long)last, (unsigned long long)(s->memory ? s->memory->getLength() : 0),
++			    w, h, dx, dy, why ? why : "none");
++		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			if (diag) {
++				uint32_t nzSrc = 0, nzDst = 0;
++				for (int32_t y = 0; y < h; y += 97) {
++					const uint32_t *ps = (const uint32_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4);
++					const uint32_t *pd = (const uint32_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4);
++					for (int32_t x = 0; x < w; x++) {
++						nzSrc += ps[x] != 0;
++						nzDst += pd[x] != 0;
++					}
++				}
++				IOLog("SWEET FB diag: layer %u nonzero words (sampled rows) src %u dst %u of %d per row\n", layer, nzSrc, nzDst, w);
++			}
+ 		}
+ 		s->release();
+ 	}
