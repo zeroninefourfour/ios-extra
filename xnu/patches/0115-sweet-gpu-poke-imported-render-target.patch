@@ -1,0 +1,137 @@
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoCpu.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoCpu.cpp
+index 5719185..14c83d2 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoCpu.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoCpu.cpp
+@@ -119,6 +119,14 @@ uint32_t NativeAdrenoSampleNonzeroWords(uint64_t physical,size_t bytes,size_t st
+     if(sampled)*sampled=count;
+     return nonzero;
+ }
++bool NativeAdrenoReadPhysicalWord(uint64_t physical,uint32_t *value)
++{
++    if(!value || (physical&3) || physical<gPhysBase || physical-gPhysBase>=gPhysSize)return false;
++    const vm_offset_t alias=phystokv(physical);
++    if(!alias)return false;
++    *value=*reinterpret_cast<const volatile uint32_t *>(alias);
++    return true;
++}
+ /* A user BO's pages become Normal non-cacheable (write-combined) for every CPU mapping the pmap tracks: the kernel's own mapping and each
+  * client view. The views did not get the cache mode their mapping asked for (int-070: Turnip's write-combine view left IB words in a CPU
+  * cache line), but they do take the page's own attribute. That is the Linux msm model for its WC BOs: CPU writes reach DRAM, the GPU's
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoMemory.h b/iokit/Kernel/arm/adreno/NativeAdrenoMemory.h
+index 3747550..c0d073b 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoMemory.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoMemory.h
+@@ -20,6 +20,8 @@ IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,Native
+ /* Diagnostic (0109): counts the non-zero 32-bit words at every `stride` bytes (a multiple of 4) of [physical, physical+bytes) read through the physical
+  * aperture; *sampled is the number of words read. Pages outside the kernel's DRAM are skipped. */
+ uint32_t NativeAdrenoSampleNonzeroWords(uint64_t physical,size_t bytes,size_t stride,uint32_t *sampled);
++/* NEXT AGENT (0115, diagnostic): one 32-bit word through the kernel's cacheable physical alias; false outside kernel DRAM. */
++bool NativeAdrenoReadPhysicalWord(uint64_t physical,uint32_t *value);
+ /* Every CPU mapping of the spans' pages becomes write-combined (true) or takes the default cacheable attribute again (false). */
+ IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *,size_t count,bool write_combined);
+ /* int-100 found a write-combined BO's page back at the default (cacheable) attribute with dirty IB lines: XNU's view machinery sets a page's
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+index cc2db74..c77dd0b 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -60,6 +60,45 @@ IOReturn NativeAdrenoSubmit::release(Job &job)
+     if(vm_->acquireImported())return poison();
+     job={};return kIOReturnSuccess;
+ }
++/* NEXT AGENT (0115, diagnostic, remove once the black screen is explained). pull14 showed that no GPU render/blit output reaches the imported
++ * surfaces' DRAM (a CPU prefill survives every clear), while the kernel's own CP_MEM_WRITE smoke test works on the kernel's scratch BO. This
++ * separates the two failure classes: after a job completes, the CP itself writes a pattern into page n (1..3) of the first imported, writable
++ * BO >= 1 MiB of this VM through the same iova/SMMU mapping the render target is written through; the page is cleaned first and cleaned+
++ * invalidated afterwards (publishForDevice / acquireDeviceWrites), then read through the physical alias. Log line "poke #n".
++ *   pattern read back => iova, SMMU mapping, pa and cache handling are right: the loss is in the RB/2D/CCU/UCHE write-out of the 3D pipe.
++ *   old value read back => the CP's write through this mapping goes elsewhere or is lost (mapping / cache attributes / permission).
++ * Three pokes per boot; they overwrite 4 bytes at offset n*0x1000 of the surface (a few pixels in the first rows). */
++void NativeAdrenoSubmit::pokeImported(const NativeAdrenoRingClock *clock)
++{
++    static unsigned done;
++    if(done>=3 || !clock)return;
++    uint64_t base=0;
++    NativeAdrenoMemory *memory=vm_->firstLargeWritableImport(&base);
++    if(!memory)return;
++    const unsigned n=++done;
++    const size_t offset=(size_t)0x1000*n;
++    const uint32_t pattern=0xc0de0000u+n;
++    const uint64_t target=base+offset;
++    uint64_t physical=0;
++    for(size_t j=0;j<memory->spanCount();++j) {
++        const auto &span=memory->spans()[j];
++        if(offset>=span.offset && offset-span.offset<span.bytes) {physical=span.physical+(offset-span.offset);break;}
++    }
++    const IOReturn published=memory->publishForDevice(offset,4096,true);
++    uint32_t before=~0u,after=~0u;
++    const bool haveBefore=NativeAdrenoReadPhysicalWord(physical,&before);
++    uint32_t pm4[4];
++    AdrenoPM4Type7(0x3d,3,&pm4[0]);
++    pm4[1]=(uint32_t)target;pm4[2]=(uint32_t)(target>>32);pm4[3]=pattern;
++    uint32_t fence=0;
++    const IOReturn submitted=ring_->submit(pm4,4,&fence);
++    const NativeAdrenoRingFence waited=submitted==kIOReturnSuccess?ring_->wait(fence,clock,200000,nullptr):NativeAdrenoRingFenceArgument;
++    const IOReturn acquired=memory->acquireDeviceWrites(offset,4096);
++    const bool haveAfter=NativeAdrenoReadPhysicalWord(physical,&after);
++    IOLog("NativeAdrenoSubmit: poke #%u iova 0x%llx pa 0x%llx: before %08x%s, wrote %08x, after %08x%s -> %s (publish 0x%x submit 0x%x fence %u wait %d acquire 0x%x)\n",
++        n,(unsigned long long)target,(unsigned long long)physical,(unsigned)before,haveBefore?"":"?",(unsigned)pattern,(unsigned)after,haveAfter?"":"?",
++        after==pattern?"PATTERN LANDED":"PATTERN NOT SEEN",(unsigned)published,(unsigned)submitted,fence,(int)waited,(unsigned)acquired);
++}
+ IOReturn NativeAdrenoSubmit::detach()
+ {
+     if(poisoned_ || outstanding())return kIOReturnBusy;
+@@ -299,6 +338,7 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
+     IOReturn status=release(*job);
+     if(status)return status;
+     ++stats_.completed;
++    pokeImported(clock);   /* 0115 diagnostic */
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoSubmit::waitAll(const NativeAdrenoRingClock *clock,uint32_t timeout_us)
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.h b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.h
+index 78f19e0..0bfda3a 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.h
+@@ -47,6 +47,8 @@ class NativeAdrenoSubmit final {
+     Job *find(uint32_t fence);
+     Job *free();
+     IOReturn release(Job &);
++    /* NEXT AGENT (0115, diagnostic): CP_MEM_WRITE a pattern into a big imported render-target BO and read it back; see the .cpp. */
++    void pokeImported(const NativeAdrenoRingClock *);
+     IOReturn poison();
+ public:
+     NativeAdrenoSubmit()=default;
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+index 3524981..ea8075b 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -385,6 +385,15 @@ IOReturn NativeAdrenoVm::acquireImported()
+     }
+     return kIOReturnSuccess;
+ }
++NativeAdrenoMemory *NativeAdrenoVm::firstLargeWritableImport(uint64_t *iova) const
++{
++    if(!attached_ || poisoned_ || !iova)return nullptr;
++    for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
++        const Mapping &m=mappings_[i];
++        if(m.memory && m.memory->imported() && (m.permissions&ArmSmmu4KWrite) && m.memory->bytes()>=(1u<<20)) {*iova=m.iova;return m.memory;}
++    }
++    return nullptr;
++}
+ void NativeAdrenoVm::probeIova(uint64_t iova,uint32_t rem,uint32_t initSize,uint32_t roqRem,bool dumpAll) const
+ {
+     if(!attached_)return;
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+index 2d28e86..328e346 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+@@ -98,6 +98,9 @@ public:
+      * (an IOSurface) reads what the GPU wrote, not a line prefetched while the GPU ran. Jobs name only their IBs, so every such BO
+      * is covered. int-071: an imported render target read back 672 of 4096 texels stale. */
+     IOReturn acquireImported();
++    /* NEXT AGENT (0115, diagnostic): the first mapping that is an imported, GPU-writable BO of at least 1 MiB (a render target / the screen's
++     * surface), or null; *iova is its GPU address. Used by NativeAdrenoSubmit::pokeImported. */
++    NativeAdrenoMemory *firstLargeWritableImport(uint64_t *iova) const;
+     /* Diagnostic, never a proof of coherence: the 32-bit word at a mapped GPU address as the kernel's cacheable alias reads it
+      * and, when the board installed native_adreno_dram_read32, as DRAM reads it through an uncached mapping (else ~0). */
+     IOReturn sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dram) const;
