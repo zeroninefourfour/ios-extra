@@ -1,0 +1,47 @@
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+index c77dd0b..f483e02 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -71,7 +71,8 @@ IOReturn NativeAdrenoSubmit::release(Job &job)
+ void NativeAdrenoSubmit::pokeImported(const NativeAdrenoRingClock *clock)
+ {
+     static unsigned done;
+-    if(done>=3 || !clock)return;
++    const unsigned kPokes=0;   /* 0116: switched off (pull15 answered it: PATTERN LANDED 3 of 3); their fences shifted the numbering of the IB dump. Set 3 to repeat. */
++    if(done>=kPokes || !clock)return;
+     uint64_t base=0;
+     NativeAdrenoMemory *memory=vm_->firstLargeWritableImport(&base);
+     if(!memory)return;
+@@ -245,6 +246,32 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
+             }
+         }
+     }
++    {
++        /* NEXT AGENT (0116, diagnostic, remove once the black screen is explained). pull14/15: no render-target clear and no 2D blit fill reaches
++         * DRAM although the CP's own CP_MEM_WRITE does (poke test), the GPU reports no fault and hw_init matches mainline. This shows the packets
++         * the GPU is actually given. One census line per submission ("IB census fence F: n IB(s) iova/bytes ..."; F = the fence this submission
++         * will signal) and the IB dwords: a whole IB when it has <= 288 dwords, else its first 48 (the big ones are state preambles / tile
++         * loops). Format "IBD f<fence> i<ib> [dw <n>] 8 words". Decode with the PM4 opcodes in NOTES (0x3d CP_MEM_WRITE, 0x46 CP_EVENT_WRITE,
++         * 0x3f CP_INDIRECT_BUFFER, 0x13/0x26 WAIT_FOR_ME/IDLE; also 0x2c CP_BLIT, 0x6d CP_REG_WRITE, 0x43 CP_SET_DRAW_STATE: confirm every opcode in
++         * Mesa's adreno_pm4.xml (build/mesa-tu-ios/src/freedreno/registers/adreno/) before relying on it). 3000 lines in total. */
++        static unsigned lineBudget=3000;
++        if(lineBudget) {
++            const uint32_t fenceNo=ring_->lastSubmitted()+1;
++            const unsigned shown=count<8?(unsigned)count:8;
++            IOLog("NativeAdrenoSubmit: IB census fence %u: %lu IB(s) queue %u\n",fenceNo,(unsigned long)count,queue);
++            for(unsigned i=0;i<shown;++i)IOLog("NativeAdrenoSubmit:   census f%u i%u iova 0x%llx bytes 0x%llx\n",fenceNo,i,(unsigned long long)buffers[i].iova,(unsigned long long)buffers[i].bytes);
++            for(unsigned i=0;i<shown && lineBudget;++i) {
++                const size_t dwords=(size_t)(buffers[i].bytes/4);
++                const size_t cap=dwords<=288?dwords:48;
++                for(size_t at=0;at<cap && lineBudget;at+=8) {
++                    uint32_t w[8]={0};const size_t n=cap-at<8?cap-at:8;
++                    (void)vm_->peekWords(buffers[i].iova+4*at,w,n);
++                    IOLog("NativeAdrenoSubmit: IBD f%u i%u [dw %4lu] %08x %08x %08x %08x %08x %08x %08x %08x\n",fenceNo,i,(unsigned long)at,w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7]);
++                    --lineBudget;
++                }
++            }
++        }
++    }
+     {
+         /* Bring-up: the first IB's head as the kernel reads it through the GPU mapping (first submissions only). */
+         static uint32_t budget=6;
