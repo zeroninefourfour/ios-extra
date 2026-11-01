@@ -110,10 +110,22 @@ jobs:
             fi
             # keep going after errors so one run reports every compile failure
             if [ "$KEEP_GOING" = true ]; then export MAKEFLAGS="-k"; else export MAKEFLAGS=""; fi
-            status=0
-            bash build.sh || status=$?
+            # Measurement only (no effect on the build): every output line gets "[seconds since
+            # start]", and `top` samples the busiest processes every 2 s into cpu-sample.txt.
+            # Both are copied into the xnu-kernel artifact under perf/.
+            STAMP='BEGIN{$|=1;$t=time} printf "[%5d] %s", time-$t, $_'
+            top -l 0 -s 2 -n 8 -o cpu -stats pid,cpu,command | perl -ne "$STAMP" > "$HOME/cpu-sample.txt" &
+            SAMPLER=$!
+            set +e
+            bash build.sh 2>&1 | perl -ne "$STAMP" | tee "$HOME/build-timed.log"
+            status=${PIPESTATUS[0]}
+            set -e
+            kill "$SAMPLER" 2>/dev/null || true
+            pkill -f "top -l 0" 2>/dev/null || true
             echo "$status" > "$HOME/build.status"
             echo "build.sh exit status: $status"
+            echo "--- phases (seconds since start) ---"
+            grep -E "⇒|Done|Kernel version banner" "$HOME/build-timed.log" | grep -vE "Applying patch|Running script" | cut -c1-120 || true
 
       - when:
           condition: << pipeline.parameters.use_ccache >>
@@ -163,7 +175,8 @@ jobs:
           name: Collect
           when: always
           command: |
-            mkdir -p out
+            mkdir -p out out/perf
+            cp "$HOME/build-timed.log" "$HOME/cpu-sample.txt" out/perf/ 2>/dev/null || true
             cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
             ls -la out
             (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
