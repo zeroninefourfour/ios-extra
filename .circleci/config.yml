@@ -116,10 +116,19 @@ jobs:
             STAMP='BEGIN{$|=1;$t=time} printf "[%5d] %s", time-$t, $_'
             top -l 0 -s 2 -n 8 -o cpu -stats pid,cpu,command | perl -ne "$STAMP" > "$HOME/cpu-sample.txt" &
             SAMPLER=$!
+            # A/B test: build output goes to a file only (23 MB of compiler warnings through the
+            # step's stdout may throttle every compiler writing to it); only phase markers are
+            # echoed to the step output.
+            : > "$HOME/build-timed.log"
+            tail -n +1 -F "$HOME/build-timed.log" 2>/dev/null | grep --line-buffered -E "⇒|Done" &
+            TAILER=$!
             set +e
-            bash build.sh 2>&1 | perl -ne "$STAMP" | tee "$HOME/build-timed.log"
+            bash build.sh 2>&1 | perl -ne "$STAMP" > "$HOME/build-timed.log"
             status=${PIPESTATUS[0]}
             set -e
+            sleep 2
+            kill "$TAILER" 2>/dev/null || true
+            pkill -f "tail -n +1 -F" 2>/dev/null || true
             kill "$SAMPLER" 2>/dev/null || true
             pkill -f "top -l 0" 2>/dev/null || true
             echo "$status" > "$HOME/build.status"
