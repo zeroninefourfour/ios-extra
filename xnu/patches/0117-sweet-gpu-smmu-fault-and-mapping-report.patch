@@ -1,0 +1,104 @@
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+@@ -120,6 +120,13 @@
+     IOReturn describe(uint64_t handle,uint64_t *iova,size_t *bytes,unsigned *permissions) const;
+     /* Up to `count` dwords of a mapped kernel-owned BO at a GPU address (through the kernel's own mapping), for the board log. */
+     IOReturn peekWords(uint64_t iova,uint32_t *out,size_t count) const;
++    /* NEXT AGENT (0117, diagnostic, remove once the black screen is explained): this driver programs the GPU's SMMU context with
++     * stall_on_fault=0, so a GPU access to an unmapped or wrongly-permitted address is terminated silently (a write is dropped) and nothing
++     * logs it. Called when `fence` completes. Read-only (never clears a fault): logs the context bank's SCTLR/FSR/FSYNR0/FAR/TTBR0 and the
++     * global sGFSR/sGFSYNR0 whenever FSR or sGFSR is non-zero (and once for the first fence), and for fences 15-18 and 24 dumps every mapping
++     * (slot, iova, bytes, permissions, imported, spans, first physical address) and says which mapping contains the addresses the self-test
++     * blit/flush used (0x20057700 and 0x20004000), or that they are NOT MAPPED. */
++    void reportSmmu(uint32_t fence) const;
+     /* Only a scheduler's actual successful GPU completion may call this.
+      * A timeout, interrupt bit alone or CPU-written timestamp is insufficient. */
+     IOReturn retireJobAfterCompletion(uint64_t handle);
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -533,6 +533,64 @@
+     }
+     return kIOReturnBadArgument;
+ }
++void NativeAdrenoVm::reportSmmu(uint32_t fence) const
++{
++    /* NEXT AGENT (0117, diagnostic): see NativeAdrenoVm.h. Output lines: "SMMU f<fence>: ...", "MAP f<fence> slot ...", "ADDR f<fence> ...". */
++    if(!attached_ || poisoned_)return;
++    static unsigned budget=600;
++    static bool first=true;
++    uint64_t offset=0;
++    for(const auto &region:regions_)if(region.state && region.state->context_offset)offset=region.state->context_offset;
++    uint32_t sctlr=0,fsr=0,fsynr0=0,farLo=0,farHi=0,gfsr=0,gfsynr0=0;
++    uint64_t ttbr0=0;
++    bool ok=offset && io_.read32;
++    if(ok) {
++        ok=!io_.read32(io_.cookie,(size_t)offset,&sctlr) && !io_.read32(io_.cookie,(size_t)offset+0x58,&fsr) &&
++            !io_.read32(io_.cookie,(size_t)offset+0x68,&fsynr0) && !io_.read32(io_.cookie,(size_t)offset+0x60,&farLo) &&
++            !io_.read32(io_.cookie,(size_t)offset+0x64,&farHi);
++        if(io_.read64)(void)io_.read64(io_.cookie,(size_t)offset+0x20,&ttbr0);
++        (void)io_.read32(io_.cookie,0x48,&gfsr);
++        (void)io_.read32(io_.cookie,0x50,&gfsynr0);
++    }
++    const bool faulted=ok && (fsr || gfsr);
++    if(budget && (faulted || first || !ok)) {
++        --budget;
++        IOLog("NativeAdrenoVm: SMMU f%u: %s ctx offset 0x%llx sctlr 0x%x fsr 0x%x fsynr0 0x%x far 0x%x:%08x ttbr0 0x%llx sGFSR 0x%x sGFSYNR0 0x%x%s\n",
++            fence,ok?"read":"READ FAILED",(unsigned long long)offset,sctlr,fsr,fsynr0,farHi,farLo,(unsigned long long)ttbr0,gfsr,gfsynr0,
++            faulted?" -> A FAULT IS PENDING":"");
++    }
++    first=false;
++    if(!((fence>=15 && fence<=18) || fence==24))return;
++    static uint32_t dumped[8];
++    static unsigned dumpedCount;
++    for(unsigned k=0;k<dumpedCount;++k)if(dumped[k]==fence)return;
++    if(dumpedCount<8)dumped[dumpedCount++]=fence;
++    unsigned live=0;
++    for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
++        const Mapping &m=mappings_[i];
++        if(!m.memory)continue;
++        ++live;
++        if(!budget)continue;
++        --budget;
++        IOLog("NativeAdrenoVm: MAP f%u slot %lu iova 0x%llx bytes 0x%lx perm %u (1r 2w 4x 8p) imported %u wb %u share %u spans %lu/%lu pa0 0x%llx jobs %u\n",
++            fence,(unsigned long)i,(unsigned long long)m.iova,(unsigned long)m.memory->bytes(),m.permissions,m.memory->imported()?1u:0u,m.writeback,
++            m.shareability,(unsigned long)m.mapped_spans,(unsigned long)m.spans,
++            (unsigned long long)(m.memory->spanCount()?m.memory->spans()[0].physical:0),m.jobs);
++    }
++    static const uint64_t probes[]={0x20057700ull,0x20004000ull};
++    for(const uint64_t probe:probes) {
++        bool found=false;
++        for(size_t i=0;i<NativeAdrenoVmMaxObjects && !found;++i) {
++            const Mapping &m=mappings_[i];
++            if(!m.memory || probe<m.iova || probe-m.iova>=m.memory->bytes())continue;
++            found=true;
++            IOLog("NativeAdrenoVm: ADDR f%u 0x%llx -> slot %lu +0x%llx of 0x%lx perm %u (1r 2w 4x 8p) imported %u spans %lu/%lu (%u live mappings)\n",fence,
++                (unsigned long long)probe,(unsigned long)i,(unsigned long long)(probe-m.iova),(unsigned long)m.memory->bytes(),m.permissions,
++                m.memory->imported()?1u:0u,(unsigned long)m.mapped_spans,(unsigned long)m.spans,live);
++        }
++        if(!found)IOLog("NativeAdrenoVm: ADDR f%u 0x%llx -> NOT MAPPED in any mapping (%u live mappings)\n",fence,(unsigned long long)probe,live);
++    }
++}
+ IOReturn NativeAdrenoVm::holdJob(uint64_t handle)
+ {
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -336,6 +336,7 @@
+             native_adreno_fence_wait[4]=ring_->lastSubmitted();native_adreno_fence_wait[5]=ring_->completedFence();
+             return kIOReturnTimeout;
+         }
++        vm_->reportSmmu(fence);   /* 0117 diagnostic */
+         return kIOReturnSuccess;
+     }
+     const NativeAdrenoRingFence result=ring_->wait(fence,clock,timeout_us,&observed);
+@@ -366,6 +367,7 @@
+     if(status)return status;
+     ++stats_.completed;
+     pokeImported(clock);   /* 0115 diagnostic */
++    vm_->reportSmmu(fence);   /* 0117 diagnostic */
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoSubmit::waitAll(const NativeAdrenoRingClock *clock,uint32_t timeout_us)
