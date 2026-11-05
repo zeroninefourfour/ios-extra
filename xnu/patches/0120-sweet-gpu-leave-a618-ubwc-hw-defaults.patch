@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -516,13 +516,19 @@
+@@ -516,13 +516,20 @@
      gpu_write32(&gpu_window, A618_UCHE_CACHE_WAYS, 0x4);
      gpu_write32(&gpu_window, A618_UCHE_CLIENT_PF, (1u << 7) | 1u);
  
@@ -17,11 +17,12 @@
 +     * or RBBM_NC_MODE_CNTL on A618 causes CCU / UCHE bus transactions to drop or misroute,
 +     * resulting in rendered pixels never reaching DRAM.
 +     * Leave them at hardware defaults and log their values. */
-+    const uint32_t def_rb_nc = gpu_read32(&gpu_window, A618_RB_NC_MODE_CNTL);
-+    const uint32_t def_tpl1_nc = gpu_read32(&gpu_window, A618_TPL1_NC_MODE_CNTL);
-+    const uint32_t def_sp_nc = gpu_read32(&gpu_window, A618_SP_NC_MODE_CNTL);
-+    const uint32_t def_uche_nc = gpu_read32(&gpu_window, A618_UCHE_MODE_CNTL);
-+    const uint32_t def_rbbm_nc = gpu_read32(&gpu_window, A618_RBBM_NC_MODE_CNTL);
++    uint32_t def_rb_nc = 0, def_tpl1_nc = 0, def_sp_nc = 0, def_uche_nc = 0, def_rbbm_nc = 0;
++    gpu_read32(&gpu_window, A618_RB_NC_MODE_CNTL, &def_rb_nc);
++    gpu_read32(&gpu_window, A618_TPL1_NC_MODE_CNTL, &def_tpl1_nc);
++    gpu_read32(&gpu_window, A618_SP_NC_MODE_CNTL, &def_sp_nc);
++    gpu_read32(&gpu_window, A618_UCHE_MODE_CNTL, &def_uche_nc);
++    gpu_read32(&gpu_window, A618_RBBM_NC_MODE_CNTL, &def_rbbm_nc);
 +    IOLog("NativeAdreno: A618 hw default NC_MODE: RB 0x%x, TPL1 0x%x, SP 0x%x, UCHE 0x%x, RBBM 0x%x\n",
 +        (unsigned)def_rb_nc, (unsigned)def_tpl1_nc, (unsigned)def_sp_nc, (unsigned)def_uche_nc, (unsigned)def_rbbm_nc);
      gpu_write32(&gpu_window, A618_CP_PERFCTR_CP_SEL0, 0); /* PERF_CP_ALWAYS_COUNT */
