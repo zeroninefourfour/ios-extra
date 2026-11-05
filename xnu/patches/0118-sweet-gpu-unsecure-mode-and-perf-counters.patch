@@ -1,0 +1,125 @@
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -552,7 +552,7 @@
+         (void)io_.read32(io_.cookie,0x48,&gfsr);
+         (void)io_.read32(io_.cookie,0x50,&gfsynr0);
+     }
+-    const bool faulted=ok && (fsr || gfsr);
++    const bool faulted=ok && ((fsr & 0xc00001feu) || gfsr);
+     if(budget && (faulted || first || !ok)) {
+         --budget;
+         IOLog("NativeAdrenoVm: SMMU f%u: %s ctx offset 0x%llx sctlr 0x%x fsr 0x%x fsynr0 0x%x far 0x%x:%08x ttbr0 0x%llx sGFSR 0x%x sGFSYNR0 0x%x%s\n",
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.h b/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
+@@ -96,6 +96,8 @@
+     uint32_t completedFence() const {return completed_;}
+     /* Diagnostic (0112): the CP's current IB1 (CP_IB1_BASE 0x928/0x929, CP_IB1_REM_SIZE 0x92a, dwords left). false when a register read failed. */
+     bool readIb1(uint64_t *base,uint32_t *rem,uint32_t *initSize=nullptr,uint32_t *roqRem=nullptr);   /* 0113: initSize = CP_IB1_INIT_SIZE (0x943) */
++    /* Diagnostic (0118): read RB and CCU 64-bit performance counters (lower 32 bits). false when a register read failed. */
++    bool readPerfCounters(uint32_t *rb2d,uint32_t *rb3d,uint32_t *ccu2d,uint32_t *ccuColor);
+     uint32_t submissions() const {return submissions_;}
+     uint32_t readPointer() const {return rptr_shadow_;}
+ };
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+@@ -252,6 +252,17 @@
+     if(roqRem && !io_.read32(io_.cookie,0x0949,&roq))*roqRem=roq>>16;
+     return true;
+ }
++bool NativeAdrenoRing::readPerfCounters(uint32_t *rb2d,uint32_t *rb3d,uint32_t *ccu2d,uint32_t *ccuColor)
++{
++    uint32_t r2=0,r3=0,c2=0,cc=0;
++    if(!attached_ || io_.read32(io_.cookie,0x04d6,&r2) || io_.read32(io_.cookie,0x04d8,&r3) ||
++        io_.read32(io_.cookie,0x045c,&c2) || io_.read32(io_.cookie,0x045e,&cc))return false;
++    if(rb2d)*rb2d=r2;
++    if(rb3d)*rb3d=r3;
++    if(ccu2d)*ccu2d=c2;
++    if(ccuColor)*ccuColor=cc;
++    return true;
++}
+ NativeAdrenoRingFence NativeAdrenoRing::wait(uint32_t fence,const NativeAdrenoRingClock *clock,
+     uint32_t timeout_us,uint32_t *observed)
+ {
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
+@@ -533,6 +533,15 @@
+     gpu_write32(&gpu_window, A618_CP_AHB_CNTL, 1);
+     gpu_write32(&gpu_window, A618_RBBM_PERFCTR_CNTL, 1);
+     gpu_write32(&gpu_window, A618_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
++    /* Diagnostic (0118): RB and CCU performance counter selectors.
++     * RB_PERFCTR_RB_SEL[0] = 28 (PERF_RB_2D_VALID_PIXELS)
++     * RB_PERFCTR_RB_SEL[1] = 29 (PERF_RB_3D_PIXELS)
++     * RB_PERFCTR_CCU_SEL[0] = 28 (PERF_CCU_2D_WR_REQ)
++     * RB_PERFCTR_CCU_SEL[1] = 5 (PERF_CCU_COLOR_BLOCKS) */
++    gpu_write32(&gpu_window, 0x8e10, 28);
++    gpu_write32(&gpu_window, 0x8e11, 29);
++    gpu_write32(&gpu_window, 0x8e18, 28);
++    gpu_write32(&gpu_window, 0x8e19, 5);
+     gpu_write32(&gpu_window, A618_RBBM_INTERFACE_HANG_INT_CNTL, (1u << 30) | 0x1fffff);
+     /* No CP_APRIV_CNTL: A618 lacks ADRENO_QUIRK_HAS_HW_APRIV in mainline a6xx_catalog.c, so a6xx_hw_init never writes it.
+      * The old value 0x6e (CDWRITE|CDREAD|RBRPWB|RBPRIVLEVEL|RBFETCH) is the A650-family one; it made the CP's memory writes
+@@ -664,8 +673,23 @@
+         IOLog("NativeAdreno: A6xx CP_ME_INIT completed successfully (fence %u)\n", init_fence);
+     }
+ 
+-    /* Mainline writes RBBM_SECVID_TRUST_CNTL = 0 here when no zap shader was loaded. On sweet (DT names a615_zap) that access hung
+-     * the SoC: fe31b51 booted to the secvid-trust-cntl marker, then the log and the USB console both stopped. Not written. */
++    /* The GPU boots up in secure mode. When a zap shader is present, non-secure EL1 MMIO access to
++     * RBBM_SECVID_TRUST_CNTL hangs the SoC (fe31b51). Both mainline Linux (a6xx_gpu.c:1493) and Android KGSL
++     * (adreno_ringbuffer.c:488) switch out of secure mode by submitting CP_SET_SECURE_MODE (opcode 0x66, payload 0)
++     * through the CP ring buffer, which instructs SQE microcode to transition the GPU to unsecure mode. */
++    svc_step("set-secure-mode");
++    uint32_t sec_pm4[2];
++    AdrenoPM4Type7(0x66, 1, &sec_pm4[0]);
++    sec_pm4[1] = 0; /* 0 = unsecure */
++    uint32_t sec_fence = 0;
++    IOReturn sec_sub_ret = ring_.submit(sec_pm4, 2, &sec_fence);
++    uint32_t sec_obs = 0;
++    const NativeAdrenoRingFence sec_wait = (sec_sub_ret == kIOReturnSuccess) ?
++        ring_.wait(sec_fence, &clock, 200000, &sec_obs) : NativeAdrenoRingFenceArgument;
++    IOLog("NativeAdreno: CP_SET_SECURE_MODE (0x66) submit 0x%x fence %u -> %s (observed %u)\n",
++        (unsigned)sec_sub_ret, (unsigned)sec_fence,
++        sec_wait == NativeAdrenoRingFenceComplete ? "COMPLETED" : "TIMED OUT", (unsigned)sec_obs);
++    if (sweet_log_sync) sweet_log_sync();
+ 
+     svc_step("smoke-test");
+     /* 10. Smoke Test: CP memory writeback */
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -318,6 +318,15 @@
+     if(result==NativeAdrenoRingFenceTimeout)return kIOReturnTimeout;
+     return kIOReturnSuccess;
+ }
++static void reportPerfCounters(NativeAdrenoRing *ring, uint32_t fence)
++{
++    if(!ring || !((fence >= 15 && fence <= 18) || fence == 24)) return;
++    uint32_t rb2d = 0, rb3d = 0, ccu2d = 0, ccuColor = 0;
++    if(ring->readPerfCounters(&rb2d, &rb3d, &ccu2d, &ccuColor)) {
++        IOLog("NativeAdrenoSubmit: PERF f%u: RB 2D valid pixels %u, RB 3D pixels %u, CCU 2D wr req %u, CCU color blocks %u\n",
++            fence, rb2d, rb3d, ccu2d, ccuColor);
++    }
++}
+ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *clock,
+     uint32_t timeout_us)
+ {
+@@ -337,6 +346,7 @@
+             return kIOReturnTimeout;
+         }
+         vm_->reportSmmu(fence);   /* 0117 diagnostic */
++        reportPerfCounters(ring_, fence);   /* 0118 diagnostic */
+         return kIOReturnSuccess;
+     }
+     const NativeAdrenoRingFence result=ring_->wait(fence,clock,timeout_us,&observed);
+@@ -368,6 +378,7 @@
+     ++stats_.completed;
+     pokeImported(clock);   /* 0115 diagnostic */
+     vm_->reportSmmu(fence);   /* 0117 diagnostic */
++    reportPerfCounters(ring_, fence);   /* 0118 diagnostic */
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoSubmit::waitAll(const NativeAdrenoRingClock *clock,uint32_t timeout_us)
