@@ -1,0 +1,56 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..2dee601 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -39,6 +39,11 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <mach/vm_types.h>
++#include <mach/vm_param.h>
++#include <vm/memory_types.h>
++
++extern "C" void pmap_set_cache_attributes(ppnum_t pn, unsigned int cacheattr);
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -82,6 +87,13 @@ SweetSurface::free()
+ {
+ 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
++		for (size_t offset = 0; offset < allocSize; offset += page_size) {
++			IOByteCount len = 0;
++			addr64_t pa = memory->getPhysicalSegment(offset, &len, kIOMemoryMapperNone);
++			if (pa) {
++				pmap_set_cache_attributes((ppnum_t)atop_64(pa), VM_WIMG_USE_DEFAULT);
++			}
++		}
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
+@@ -689,15 +701,22 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+ 			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache, s->allocSize, page_size);
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 			ret = kIOReturnNoMemory;
+ 		} else {
+-			bzero(mem->getBytesNoCopy(), s->allocSize);
+ 			s->memory = mem;
+-			s->mapCache = kIOMapDefaultCache;
++			s->mapCache = kIOMapWriteCombineCache;
++			for (size_t offset = 0; offset < s->allocSize; offset += page_size) {
++				IOByteCount len = 0;
++				addr64_t pa = mem->getPhysicalSegment(offset, &len, kIOMemoryMapperNone);
++				if (pa) {
++					pmap_set_cache_attributes((ppnum_t)atop_64(pa), VM_WIMG_WCOMB);
++				}
++			}
++			bzero((void *)s->kernelAddress(), s->allocSize);
+ 			if (!sweet_surface_publish(s)) {
+ 				ret = kIOReturnNoResources;
+ 			}
