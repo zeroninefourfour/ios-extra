@@ -1,0 +1,40 @@
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
+@@ -516,13 +516,19 @@
+     gpu_write32(&gpu_window, A618_UCHE_CACHE_WAYS, 0x4);
+     gpu_write32(&gpu_window, A618_UCHE_CLIENT_PF, (1u << 7) | 1u);
+ 
+-    /* a6xx_set_ubwc_config with sm7150_data (UBWC 2.0, swizzle LVL2|LVL3, highest bank bit 14; sweet DT also says 14):
+-     * hbb_lo = 14 - 13 = 1, no UBWC 1.0 mode, no AMSBC, 32-byte min access, no macrotile. */
+-    gpu_write32(&gpu_window, A618_RB_NC_MODE_CNTL, 1u << 1);
+-    gpu_write32(&gpu_window, A618_TPL1_NC_MODE_CNTL, 1u << 1);
+-    gpu_write32(&gpu_window, A618_SP_NC_MODE_CNTL, 1u << 1);
+-    gpu_write32(&gpu_window, A618_UCHE_MODE_CNTL, 1u << 21);
+-    gpu_write32(&gpu_window, A618_RBBM_NC_MODE_CNTL, 0);
++    /* Upstream Linux drm/msm (a6xx_gpu.c: a6xx_set_ubwc_config):
++     * "a618 is using the hw default values" -> returns immediately without writing.
++     * Overriding RB_NC_MODE_CNTL, TPL1_NC_MODE_CNTL, SP_NC_MODE_CNTL, UCHE_MODE_CNTL,
++     * or RBBM_NC_MODE_CNTL on A618 causes CCU / UCHE bus transactions to drop or misroute,
++     * resulting in rendered pixels never reaching DRAM.
++     * Leave them at hardware defaults and log their values. */
++    const uint32_t def_rb_nc = gpu_read32(&gpu_window, A618_RB_NC_MODE_CNTL);
++    const uint32_t def_tpl1_nc = gpu_read32(&gpu_window, A618_TPL1_NC_MODE_CNTL);
++    const uint32_t def_sp_nc = gpu_read32(&gpu_window, A618_SP_NC_MODE_CNTL);
++    const uint32_t def_uche_nc = gpu_read32(&gpu_window, A618_UCHE_MODE_CNTL);
++    const uint32_t def_rbbm_nc = gpu_read32(&gpu_window, A618_RBBM_NC_MODE_CNTL);
++    IOLog("NativeAdreno: A618 hw default NC_MODE: RB 0x%x, TPL1 0x%x, SP 0x%x, UCHE 0x%x, RBBM 0x%x\n",
++        (unsigned)def_rb_nc, (unsigned)def_tpl1_nc, (unsigned)def_sp_nc, (unsigned)def_uche_nc, (unsigned)def_rbbm_nc);
+     gpu_write32(&gpu_window, A618_CP_PERFCTR_CP_SEL0, 0); /* PERF_CP_ALWAYS_COUNT */
+ 
+     /* 5. Configure CP thresholds, pool size, APRIV */
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -352,7 +352,7 @@
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+     for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
+         const Mapping &m=mappings_[i];
+-        if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite))continue;
++        if(!m.memory || !(m.permissions&ArmSmmu4KWrite))continue;
+         if(coherentMapping(m.writeback)) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
+         const IOReturn acquired=m.memory->acquireDeviceWrites(0,m.memory->bytes());
+         if(acquired) {
