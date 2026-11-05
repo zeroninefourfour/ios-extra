@@ -1,0 +1,45 @@
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
+index 733ea90..afc6604 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
+@@ -673,23 +673,10 @@ bool NativeAdrenoGpuService::bringUp()
+         IOLog("NativeAdreno: A6xx CP_ME_INIT completed successfully (fence %u)\n", init_fence);
+     }
+ 
+-    /* The GPU boots up in secure mode. When a zap shader is present, non-secure EL1 MMIO access to
+-     * RBBM_SECVID_TRUST_CNTL hangs the SoC (fe31b51). Both mainline Linux (a6xx_gpu.c:1493) and Android KGSL
+-     * (adreno_ringbuffer.c:488) switch out of secure mode by submitting CP_SET_SECURE_MODE (opcode 0x66, payload 0)
+-     * through the CP ring buffer, which instructs SQE microcode to transition the GPU to unsecure mode. */
+-    svc_step("set-secure-mode");
+-    uint32_t sec_pm4[2];
+-    AdrenoPM4Type7(0x66, 1, &sec_pm4[0]);
+-    sec_pm4[1] = 0; /* 0 = unsecure */
+-    uint32_t sec_fence = 0;
+-    IOReturn sec_sub_ret = ring_.submit(sec_pm4, 2, &sec_fence);
+-    uint32_t sec_obs = 0;
+-    const NativeAdrenoRingFence sec_wait = (sec_sub_ret == kIOReturnSuccess) ?
+-        ring_.wait(sec_fence, &clock, 200000, &sec_obs) : NativeAdrenoRingFenceArgument;
+-    IOLog("NativeAdreno: CP_SET_SECURE_MODE (0x66) submit 0x%x fence %u -> %s (observed %u)\n",
+-        (unsigned)sec_sub_ret, (unsigned)sec_fence,
+-        sec_wait == NativeAdrenoRingFenceComplete ? "COMPLETED" : "TIMED OUT", (unsigned)sec_obs);
+-    if (sweet_log_sync) sweet_log_sync();
++    /* Mainline writes RBBM_SECVID_TRUST_CNTL = 0 here when no zap shader was loaded. On sweet (DT names a615_zap) that access hung
++     * the SoC: fe31b51 booted to the secvid-trust-cntl marker, then the log and the USB console both stopped.
++     * CP_SET_SECURE_MODE (0x66) also timed out in pull18 because SQE requires a zap shader authenticated by TrustZone.
++     * Therefore, leave secure control untouched. */
+ 
+     svc_step("smoke-test");
+     /* 10. Smoke Test: CP memory writeback */
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+index 7504431..92fdc86 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -320,7 +320,7 @@ IOReturn NativeAdrenoSubmit::observeFence(uint32_t fence,const NativeAdrenoRingC
+ }
+ static void reportPerfCounters(NativeAdrenoRing *ring, uint32_t fence)
+ {
+-    if(!ring || !((fence >= 15 && fence <= 18) || fence == 24)) return;
++    if(!ring || fence < 3 || fence > 35) return;
+     uint32_t rb2d = 0, rb3d = 0, ccu2d = 0, ccuColor = 0;
+     if(ring->readPerfCounters(&rb2d, &rb3d, &ccu2d, &ccuColor)) {
+         IOLog("NativeAdrenoSubmit: PERF f%u: RB 2D valid pixels %u, RB 3D pixels %u, CCU 2D wr req %u, CCU color blocks %u\n",
