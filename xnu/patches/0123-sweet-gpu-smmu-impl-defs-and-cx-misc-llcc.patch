@@ -1,5 +1,3 @@
-diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoA618HwInit.h b/iokit/Kernel/arm/adreno/NativeAdrenoA618HwInit.h
-index 28cb487..b2ab6c7 100644
 --- a/iokit/Kernel/arm/adreno/NativeAdrenoA618HwInit.h
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoA618HwInit.h
 @@ -17,6 +17,8 @@
@@ -11,11 +9,9 @@ index 28cb487..b2ab6c7 100644
  #define A618_GBIF_HALT 0x03c45
  #define A618_RBBM_GBIF_HALT 0x00016
  #define A618_RBBM_SECVID_TSB_CNTL 0x0f803
-diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp
-index 280dd52..398c8c7 100644
 --- a/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoPublish.cpp
-@@ -461,7 +461,7 @@ static IOReturn dispatch(NativeAdrenoConnection *connection,uint32_t method,cons
+@@ -461,7 +461,7 @@
      native_adreno_metal_diag.last_status=uint32_t(status);
      /* bring-up trace: the first calls of every client, one line each. When a client dies the last line names the method it was in. */
      static uint32_t call_log_budget=600;
@@ -24,15 +20,12 @@ index 280dd52..398c8c7 100644
          --call_log_budget;
          IOLog("NativeAdrenoUC: %s method %u in %lu out %lu -> 0x%x\n",connection->name_,method,(unsigned long)input_size,
              (unsigned long)output_size,(unsigned)status);
-diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-index d533aa8..6a6d654 100644
 --- a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
-@@ -406,6 +406,37 @@ bool NativeAdrenoGpuService::bringUp()
-         teardown();
+@@ -407,6 +407,37 @@
          return false;
      }
-+
+ 
 +    /* Program Qualcomm SMMU-v500 implementation-defined registers (sweet DT attach-impl-defs).
 +     * These configure TBU/TCU cache coherence, prefetch, and bus interfaces for SDMMAGPIE/SM7150. */
 +    static const struct {
@@ -63,13 +56,15 @@ index d533aa8..6a6d654 100644
 +                kSmmuImplDefs[i].offset, old_val, kSmmuImplDefs[i].val, new_val);
 +        }
 +    }
- 
++
      svc_step("gpu-smmu-context");
      /* Bring up GPU Context Bank 0 for Stream 0 (gfx3d_user) via ArmSmmu4K */
-@@ -480,6 +511,34 @@ bool NativeAdrenoGpuService::bringUp()
+     svc_step("gpu-ctx-new");
+@@ -479,6 +510,34 @@
+     gpu_write32(&gpu_window, A618_RBBM_SECVID_TSB_TRUSTED_BASE, 0);
      gpu_write32(&gpu_window, A618_RBBM_SECVID_TSB_TRUSTED_BASE + 1, 0);
      gpu_write32(&gpu_window, A618_RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
- 
++
 +    /* CX_MISC System Cache (LLCC) and GBIF system cache controls:
 +     * Overriding SYSTEM_CACHE_CNTL_0 to 0x3 (writenoallocoverrideen=1, write-no-alloc=1)
 +     * forces GPU writes that miss in LLCC to not allocate cache lines, routing writes directly to DRAM.
@@ -97,15 +92,12 @@ index d533aa8..6a6d654 100644
 +    gpu_read32(&gpu_window, A618_GBIF_SCACHE_CNTL1, &new_sc1);
 +    IOLog("NativeAdreno: GBIF_SCACHE_CNTL0: 0x%x -> 0x%x, CNTL1: 0x%x -> 0x%x\n",
 +        (unsigned)old_sc0, (unsigned)new_sc0, (unsigned)old_sc1, (unsigned)new_sc1);
-+
+ 
      /* 2. Turn on 64-bit addressing on all blocks */
      static const uint32_t addr_mode_regs[] = {
-         A618_CP_ADDR_MODE_CNTL, A618_VSC_ADDR_MODE_CNTL, A618_GRAS_ADDR_MODE_CNTL,
-diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
-index 7a57a55..56885df 100644
 --- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
-@@ -376,9 +376,15 @@ IOReturn NativeAdrenoVm::acquireImported()
+@@ -376,10 +376,16 @@
                      nonzero+=NativeAdrenoSampleNonzeroWords(m.memory->spans()[j].physical,m.memory->spans()[j].bytes,256,&part);
                      sampled+=part;
                  }
@@ -118,8 +110,10 @@ index 7a57a55..56885df 100644
 +                IOLog("NativeAdrenoVm: GPU wrote slot %lu iova 0x%llx pa 0x%llx bytes 0x%lx: %u of %u sampled words non-zero (job %u); first 8: %08x %08x %08x %08x %08x %08x %08x %08x\n",
                      (unsigned long)i,(unsigned long long)m.iova,
 -                    (unsigned long long)(m.memory->spanCount()?m.memory->spans()[0].physical:0),(unsigned long)m.memory->bytes(),
+-                    nonzero,sampled,seen);
 +                    (unsigned long long)pa0,(unsigned long)m.memory->bytes(),
-                     nonzero,sampled,seen,
++                    nonzero,sampled,seen,
 +                    w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7]);
              }
          }
+     }
