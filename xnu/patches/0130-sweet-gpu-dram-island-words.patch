@@ -1,0 +1,29 @@
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -386,6 +386,25 @@
+                     (unsigned long long)pa0,(unsigned long)m.memory->bytes(),
+                     nonzero,sampled,seen,
+                     w[0],w[1],w[2],w[3],w[4],w[5],w[6],w[7]);
++                /* The first 8 words are the base of the BO. A 16 KiB fill sits further in, and both the prefill and a
++                 * real store are non-zero, so the count above cannot tell them apart. Print the first non-zero sample. */
++                if(nonzero && nonzero<=4096) {
++                    size_t foundOff=0;uint64_t foundPa=0;bool got=false;
++                    for(size_t j=0;j<m.memory->spanCount() && !got;++j) {
++                        const NativeAdrenoPhysicalSpan &sp=m.memory->spans()[j];
++                        for(size_t o=0;o+4<=sp.bytes;o+=256) {
++                            uint32_t v=0;
++                            if(NativeAdrenoReadPhysicalWord(sp.physical+o,&v) && v) {
++                                foundOff=(size_t)(sp.offset+o);foundPa=sp.physical+o;got=true;break;
++                            }
++                        }
++                    }
++                    uint32_t q[4]={};
++                    if(got)for(int k=0;k<4;++k)NativeAdrenoReadPhysicalWord(foundPa+4*(uint64_t)k,&q[k]);
++                    IOLog("NativeAdrenoVm: DRAM island slot %lu iova 0x%llx off 0x%lx pa 0x%llx words %08x %08x %08x %08x\n",
++                        (unsigned long)i,(unsigned long long)m.iova,(unsigned long)foundOff,(unsigned long long)foundPa,
++                        q[0],q[1],q[2],q[3]);
++                }
+             }
+         }
+     }
