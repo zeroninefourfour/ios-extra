@@ -1,0 +1,36 @@
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+index c1490c1..1c34f9f 100644
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+@@ -45,7 +45,7 @@ enum : uint32_t {
+     RingWaitWriteEq = 3,
+     RingPrologueWords = 6,    /* CCU depth + color invalidate, CACHE_INVALIDATE */
+     RingResetWords = 13,
+-    RingFenceWords = 19       /* WFI + CCU Color TS + CCU Depth TS + WFI + TYPE4 scratch + CP_EVENT_WRITE CACHE_FLUSH_TS */
++    RingFenceWords = 25       /* WFI + CCU Color TS + CCU Depth TS + CCU Inval + UCHE Inval + WFI + TYPE4 scratch + CP_EVENT_WRITE CACHE_FLUSH_TS */
+ };
+ static uint32_t ilog2(size_t value)
+ {
+@@ -125,11 +125,19 @@ IOReturn NativeAdrenoRing::emitFence(uint32_t at,uint32_t seqno,uint32_t *end)
+     if(n)n=packet(words,n,RingEventWrite,ccu_color,4);
+     const uint32_t ccu_depth[4]={RingCcuFlushDepthTs,(uint32_t)ccu_ts_addr,(uint32_t)(ccu_ts_addr>>32),seqno};
+     if(n)n=packet(words,n,RingEventWrite,ccu_depth,4);
+-    /* 3. Wait for CCU flush to land in DRAM before signalling fence */
++    /* 3. Invalidate CCU color and depth caches */
++    const uint32_t inval_color=RingCcuInvalidateColor;
++    if(n)n=packet(words,n,RingEventWrite,&inval_color,1);
++    const uint32_t inval_depth=RingCcuInvalidateDepth;
++    if(n)n=packet(words,n,RingEventWrite,&inval_depth,1);
++    /* 4. Invalidate UCHE cache */
++    const uint32_t invalidate=RingCacheInvalidate;
++    if(n)n=packet(words,n,RingEventWrite,&invalidate,1);
++    /* 5. Wait for CCU flush and invalidates to land in DRAM before signalling fence */
+     if(n)n=packet(words,n,RingWaitForIdle,nullptr,0);
+-    /* 4. CP_SCRATCH(2) = seqno */
++    /* 6. CP_SCRATCH(2) = seqno */
+     if(n && AdrenoPM4Type4(RingScratch,1,&words[n])==AdrenoPM4Success) {words[n+1]=seqno;n+=2;} else n=0;
+-    /* 5. a6xx_submit's fence: CP_EVENT_WRITE CACHE_FLUSH_TS | IRQ.
++    /* 7. a6xx_submit's fence: CP_EVENT_WRITE CACHE_FLUSH_TS | IRQ.
+      * The timestamp goes to +4 (msm_rbmemptrs.fence), where wait() reads it. */
+     const uint64_t at4=fence_iova_+4;
+     const uint32_t cache_flush[4]={RingCacheFlushTs|RingFenceIrq,(uint32_t)at4,(uint32_t)(at4>>32),seqno};
