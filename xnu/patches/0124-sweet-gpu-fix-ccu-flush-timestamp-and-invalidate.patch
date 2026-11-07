@@ -1,0 +1,75 @@
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+@@ -33,6 +33,7 @@
+     /* CACHE_INVALIDATE (UCHE). a6xx_set_pagetable() sends it after every page table switch; this ring has one VM and never sends
+      * CP_SMMU_TABLE_UPDATE, so each framed submission invalidates instead (on sheng, nothing else ever invalidated UCHE). */
+     RingCacheInvalidate = 49,
++    RingTimestampEvent = 1u << 30,
+     RingFenceIrq = 1u << 31,
+     RingBlockBytes = 32,
+     /* a6xx_set_pagetable()'s entry for a new context: protected mode off, RBBM_PERFCTR_SRAM_INIT_CMD (0x050e) = 1, the
+@@ -45,7 +46,7 @@
+     RingWaitWriteEq = 3,
+     RingPrologueWords = 6,    /* CCU depth + color invalidate, CACHE_INVALIDATE */
+     RingResetWords = 13,
+-    RingFenceWords = 18       /* WFI + CCU Color/Depth flush + TYPE4 scratch + CP_EVENT_WRITE CACHE_FLUSH_TS */
++    RingFenceWords = 25       /* WFI + CCU flush TS + CCU inval + UCHE inval + WFI + TYPE4 scratch + CP_EVENT_WRITE CACHE_FLUSH_TS */
+ };
+ static uint32_t ilog2(size_t value)
+ {
+@@ -114,17 +115,29 @@
+     const uint32_t mask=(uint32_t)(ring_bytes_/4-1);
+     uint32_t words[RingFenceWords]={0};
+     size_t n=0;
+-    /* 1. Wait for 2D/3D draws and blits to complete */
++    /* 1. Wait for 2D/3D draws and blits to complete before flushing CCU */
+     n=packet(words,n,RingWaitForIdle,nullptr,0);
+-    /* 2. Flush dirty color and depth data from CCU to memory before writing fence */
++    /* 2. Flush dirty color and depth data from CCU to memory before writing fence.
++     * Adreno PM4 requires Bit 30 (RingTimestampEvent) for 4-dword event packets with timestamp destination.
++     * We pass seqno as payload so memptrs[2] receives seqno upon CCU color flush completion. */
+     const uint64_t ccu_ts_addr=fence_iova_+8;
+-    const uint32_t ccu_color[4]={RingCcuFlushColorTs,(uint32_t)ccu_ts_addr,(uint32_t)(ccu_ts_addr>>32),0};
++    const uint32_t ccu_color[4]={RingCcuFlushColorTs|RingTimestampEvent,(uint32_t)ccu_ts_addr,(uint32_t)(ccu_ts_addr>>32),seqno};
+     if(n)n=packet(words,n,RingEventWrite,ccu_color,4);
+-    const uint32_t ccu_depth[4]={RingCcuFlushDepthTs,(uint32_t)ccu_ts_addr,(uint32_t)(ccu_ts_addr>>32),0};
++    const uint32_t ccu_depth[4]={RingCcuFlushDepthTs|RingTimestampEvent,(uint32_t)ccu_ts_addr,(uint32_t)(ccu_ts_addr>>32),seqno};
+     if(n)n=packet(words,n,RingEventWrite,ccu_depth,4);
+-    /* 3. CP_SCRATCH(2) = seqno */
++    /* 3. Invalidate CCU color and depth caches */
++    const uint32_t inval_color=RingCcuInvalidateColor;
++    if(n)n=packet(words,n,RingEventWrite,&inval_color,1);
++    const uint32_t inval_depth=RingCcuInvalidateDepth;
++    if(n)n=packet(words,n,RingEventWrite,&inval_depth,1);
++    /* 4. Invalidate UCHE cache */
++    const uint32_t invalidate=RingCacheInvalidate;
++    if(n)n=packet(words,n,RingEventWrite,&invalidate,1);
++    /* 5. Wait for CCU flush and invalidates to land in memory */
++    if(n)n=packet(words,n,RingWaitForIdle,nullptr,0);
++    /* 6. CP_SCRATCH(2) = seqno */
+     if(n && AdrenoPM4Type4(RingScratch,1,&words[n])==AdrenoPM4Success) {words[n+1]=seqno;n+=2;} else n=0;
+-    /* 4. a6xx_submit's fence: CP_EVENT_WRITE CACHE_FLUSH_TS | IRQ. (The A7XX form, event 0x31 with WRITE_ENABLED, is CACHE_INVALIDATE
++    /* 7. a6xx_submit's fence: CP_EVENT_WRITE CACHE_FLUSH_TS | IRQ. (The A7XX form, event 0x31 with WRITE_ENABLED, is CACHE_INVALIDATE
+      * here and writes no timestamp.) The timestamp goes to +4 (msm_rbmemptrs.fence), where wait() reads it. */
+     const uint64_t at4=fence_iova_+4;
+     const uint32_t cache_flush[4]={RingCacheFlushTs|RingFenceIrq,(uint32_t)at4,(uint32_t)(at4>>32),seqno};
+@@ -295,7 +308,7 @@
+         if(observed)*observed=value;
+         if(value>=fence) {if(value>seqno_) {poison();return NativeAdrenoRingFencePoisoned;}completed_=value;
+             static uint32_t done_budget=8;
+-            if(done_budget) {--done_budget;IOLog("NativeAdrenoRing: fence %u complete (seen %u, newest %u)\n",fence,value,seqno_);}
++            if(done_budget) {--done_budget;IOLog("NativeAdrenoRing: fence %u complete (seen %u, newest %u, ccu_ts 0x%08x)\n",fence,value,seqno_,fence_[2]);}
+             return NativeAdrenoRingFenceComplete;}
+         if(!clock || !clock->now_us)return NativeAdrenoRingFenceTimeout;
+         if(clock->now_us(clock->cookie)-start>=timeout_us) {
+@@ -311,8 +324,8 @@
+                 uint32_t r[9];for(unsigned i=0;i<9;++i)r[i]=0xffffffffu;
+                 static const uint32_t regs[9]={RingRptr,0x0201,0x0210,0x0211,0x0821,0x0825,0x0928,0x0929,0x092a};
+                 for(unsigned i=0;i<9;++i){uint32_t v=0;if(!io_.read32(io_.cookie,regs[i],&v))r[i]=v;}
+-                IOLog("NativeAdrenoRing: late fence #%u %u: memptrs [%08x %08x %08x %08x] newest %u next %u | rptr %u int0 %08x status %08x status1 %08x hwfault %08x cpstat1 %08x ib1 %08x%08x rem %08x\n",
+-                    late,fence,fence_[0],fence_[1],fence_[2],fence_[3],seqno_,next_,r[0],r[1],r[2],r[3],r[4],r[5],r[7],r[6],r[8]);
++                IOLog("NativeAdrenoRing: late fence #%u %u: memptrs [%08x %08x %08x %08x] (ccu_ts 0x%08x) newest %u next %u | rptr %u int0 %08x status %08x status1 %08x hwfault %08x cpstat1 %08x ib1 %08x%08x rem %08x\n",
++                    late,fence,fence_[0],fence_[1],fence_[2],fence_[3],fence_[2],seqno_,next_,r[0],r[1],r[2],r[3],r[4],r[5],r[7],r[6],r[8]);
+                 /* NEXT AGENT (0113, diagnostic): pull9 left two questions the line above cannot answer. RBBM_STATUS3 bit 24 = SMMU_STALLED_ON_FAULT
+                  * (a stalled GPU translation fault, invisible otherwise because this driver has no SMMU register access); CP_IB1_INIT_SIZE (0x943) is the
+                  * IB's total dword count, so init-rem = dwords the CP has taken; IB2 (0x92b/0x92c base, 0x92d rem) shows a nested call; CP_PROTECT_STATUS
