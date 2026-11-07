@@ -1,0 +1,98 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -394,10 +394,10 @@
+ 		/* 0108: report the first presents, then every Nth, at most 120 reports. 0109: 0108 reported presents 1-4 and every 64th, but a
+ 		 * booted SpringBoard only reaches ~45 presents in 3-5 minutes (the UI is static), so the 64th never came and only the first four
+ 		 * (all-zero, possibly legitimately black) frames were seen. Report the first 80 presents, then every 32nd. */
+-		static unsigned sweet_fb_diag_budget = 120;
++		static unsigned sweet_fb_diag_budget = 300;
+ 		static unsigned sweet_fb_present_count;
+ 		sweet_fb_present_count++;
+-		const bool diag = sweet_fb_diag_budget > 0 && (sweet_fb_present_count <= 80 || (sweet_fb_present_count % 32) == 0);
++		const bool diag = sweet_fb_diag_budget > 0 && (sweet_fb_present_count <= 100 || (sweet_fb_present_count % 16) == 0);
+ 		if (diag) {
+ 			sweet_fb_diag_budget--;
+ 		}
+@@ -424,47 +424,40 @@
+ 			    w, h, dx, dy, why ? why : "none");
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			const uint64_t memLen = s->memory->getLength();
++			IOReturn maintain = kIOReturnUnsupported;
++			if (((src | memLen) & 4095) == 0) {
++				maintain = NativeAdrenoMaintainOwnedPages((void *)src, (size_t)memLen, NativeAdrenoInvalidate);
++			}
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			__asm__ volatile("dsb sy" ::: "memory");
+ 			if (diag) {
+-				/* NEXT AGENT (0108): "src" is plane 0 of the surface (sampled rows); "tail" is what follows plane 0 (a 'b3a8' surface has a
+-				 * second, alpha, plane there; sampled every 16th word), so a black RGB plane with live alpha shows up. The source is counted
+-				 * as the copy saw it ("before"), then its cache lines are invalidated (dc ivac over the whole kernel mapping, whole pages, as
+-				 * NativeAdrenoMaintainOwnedPages does for BOs) and counted again ("after"): non-zero after but zero before means the CPU was
+-				 * reading stale cache lines of memory the GPU wrote (the display copy then needs the same maintenance before it reads).
+-				 * DIAGNOSTIC ONLY: the invalidate also drops dirty CPU-written lines of this surface; remove with the rest of this diag. */
+ 				const uint64_t planeEnd = (uint64_t)s->offset + (uint64_t)s->height * s->bytesPerRow;
+-				const uint64_t memLen = s->memory->getLength();
+-				uint32_t nzDst = 0, nzSrc[2] = {0, 0}, nzTail[2] = {0, 0};
++				uint32_t nzDst = 0, nzSrc = 0, nzTail = 0;
+ 				for (int32_t y = 0; y < h; y += 97) {
+ 					const uint32_t *pd = (const uint32_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4);
+ 					for (int32_t x = 0; x < w; x++) {
+ 						nzDst += pd[x] != 0;
+ 					}
+ 				}
+-				IOReturn maintain = kIOReturnUnsupported;
+-				for (int pass = 0; pass < 2; pass++) {
+-					for (int32_t y = 0; y < h; y += 97) {
+-						const uint32_t *ps = (const uint32_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4);
+-						for (int32_t x = 0; x < w; x++) {
+-							nzSrc[pass] += ps[x] != 0;
+-						}
++				for (int32_t y = 0; y < h; y += 97) {
++					const uint32_t *ps = (const uint32_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4);
++					for (int32_t x = 0; x < w; x++) {
++						nzSrc += ps[x] != 0;
+ 					}
+-					for (uint64_t o = planeEnd; o + 4 <= memLen; o += 64) {
+-						nzTail[pass] += *(const uint32_t *)(src + o) != 0;
+-					}
+-					if (pass == 0 && ((src | memLen) & 4095) == 0) {
+-						maintain = NativeAdrenoMaintainOwnedPages((void *)src, (size_t)memLen, NativeAdrenoInvalidate);
+-					}
++				}
++				for (uint64_t o = planeEnd; o + 4 <= memLen; o += 64) {
++					nzTail += *(const uint32_t *)(src + o) != 0;
+ 				}
+ 				/* 0109: the physical address the copy reads (compare with "NativeAdrenoVm: GPU wrote ... pa" in NativeAdrenoVm.cpp). */
+ 				IOByteCount paLen = 0;
+ 				const uint64_t pa = s->memory->getPhysicalSegment(0, &paLen, kIOMemoryMapperNone);
+-				IOLog("SWEET FB diag: layer %u present %u nonzero (sampled) plane0 before %u after-invalidate %u, tail before %u after %u, panel %u, invalidate %#x, pa %#llx (w %d per row)\n",
+-				    layer, sweet_fb_present_count, nzSrc[0], nzSrc[1], nzTail[0], nzTail[1], nzDst, maintain, (unsigned long long)pa, w);
++				IOLog("SWEET FB diag: layer %u present %u nonzero plane0 %u tail %u panel %u, invalidate %#x, pa %#llx (w %d per row)\n",
++				    layer, sweet_fb_present_count, nzSrc, nzTail, nzDst, maintain, (unsigned long long)pa, w);
+ 			}
+ 		}
+ 		s->release();
+@@ -606,13 +599,12 @@
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
+ 			IOLockLock(fFB->fLock);
+-			if (off != fFB->fPowerOff) {
+-				fFB->fPowerOff = off;
+-				fFB->fFadeStep = 0;
+-				fFB->fDirty = true;     /* on: redraw the latest frame */
+-			}
++			/* Keep display permanently powered on during testing */
++			fFB->fPowerOff = false;
++			fFB->fFadeStep = 0;
++			fFB->fDirty = true;     /* on: redraw latest frame */
+ 			IOLockUnlock(fFB->fLock);
+-			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
++			IOLog("SWEET FB: display %s (power change ignored, forced on)\n", off ? "off" : "on");
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
