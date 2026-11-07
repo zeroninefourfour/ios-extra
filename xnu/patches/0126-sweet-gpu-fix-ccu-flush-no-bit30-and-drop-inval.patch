@@ -1,0 +1,56 @@
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp	2026-11-07 11:08:15.339072350 +0800
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp	2026-11-07 11:08:15.339129556 +0800
+@@ -33,7 +33,6 @@
+     /* CACHE_INVALIDATE (UCHE). a6xx_set_pagetable() sends it after every page table switch; this ring has one VM and never sends
+      * CP_SMMU_TABLE_UPDATE, so each framed submission invalidates instead (on sheng, nothing else ever invalidated UCHE). */
+     RingCacheInvalidate = 49,
+-    RingTimestampEvent = 1u << 30,
+     RingFenceIrq = 1u << 31,
+     RingBlockBytes = 32,
+     /* a6xx_set_pagetable()'s entry for a new context: protected mode off, RBBM_PERFCTR_SRAM_INIT_CMD (0x050e) = 1, the
+@@ -46,7 +45,7 @@
+     RingWaitWriteEq = 3,
+     RingPrologueWords = 6,    /* CCU depth + color invalidate, CACHE_INVALIDATE */
+     RingResetWords = 13,
+-    RingFenceWords = 25       /* WFI + CCU flush TS + CCU inval + UCHE inval + WFI + TYPE4 scratch + CP_EVENT_WRITE CACHE_FLUSH_TS */
++    RingFenceWords = 19       /* WFI + CCU Color TS + CCU Depth TS + WFI + TYPE4 scratch + CP_EVENT_WRITE CACHE_FLUSH_TS */
+ };
+ static uint32_t ilog2(size_t value)
+ {
+@@ -118,27 +117,20 @@
+     /* 1. Wait for 2D/3D draws and blits to complete before flushing CCU */
+     n=packet(words,n,RingWaitForIdle,nullptr,0);
+     /* 2. Flush dirty color and depth data from CCU to memory before writing fence.
+-     * Adreno PM4 requires Bit 30 (RingTimestampEvent) for 4-dword event packets with timestamp destination.
+-     * We pass seqno as payload so memptrs[2] receives seqno upon CCU color flush completion. */
++     * On Adreno 6xx, CP_EVENT_WRITE with timestamp takes raw event opcode in word 0,
++     * followed by 64-bit destination address and timestamp value. No Bit 30.
++     * memptrs[2] receives seqno upon CCU color flush completion. */
+     const uint64_t ccu_ts_addr=fence_iova_+8;
+-    const uint32_t ccu_color[4]={RingCcuFlushColorTs|RingTimestampEvent,(uint32_t)ccu_ts_addr,(uint32_t)(ccu_ts_addr>>32),seqno};
++    const uint32_t ccu_color[4]={RingCcuFlushColorTs,(uint32_t)ccu_ts_addr,(uint32_t)(ccu_ts_addr>>32),seqno};
+     if(n)n=packet(words,n,RingEventWrite,ccu_color,4);
+-    const uint32_t ccu_depth[4]={RingCcuFlushDepthTs|RingTimestampEvent,(uint32_t)ccu_ts_addr,(uint32_t)(ccu_ts_addr>>32),seqno};
++    const uint32_t ccu_depth[4]={RingCcuFlushDepthTs,(uint32_t)ccu_ts_addr,(uint32_t)(ccu_ts_addr>>32),seqno};
+     if(n)n=packet(words,n,RingEventWrite,ccu_depth,4);
+-    /* 3. Invalidate CCU color and depth caches */
+-    const uint32_t inval_color=RingCcuInvalidateColor;
+-    if(n)n=packet(words,n,RingEventWrite,&inval_color,1);
+-    const uint32_t inval_depth=RingCcuInvalidateDepth;
+-    if(n)n=packet(words,n,RingEventWrite,&inval_depth,1);
+-    /* 4. Invalidate UCHE cache */
+-    const uint32_t invalidate=RingCacheInvalidate;
+-    if(n)n=packet(words,n,RingEventWrite,&invalidate,1);
+-    /* 5. Wait for CCU flush and invalidates to land in memory */
++    /* 3. Wait for CCU flush to land in DRAM before signalling fence */
+     if(n)n=packet(words,n,RingWaitForIdle,nullptr,0);
+-    /* 6. CP_SCRATCH(2) = seqno */
++    /* 4. CP_SCRATCH(2) = seqno */
+     if(n && AdrenoPM4Type4(RingScratch,1,&words[n])==AdrenoPM4Success) {words[n+1]=seqno;n+=2;} else n=0;
+-    /* 7. a6xx_submit's fence: CP_EVENT_WRITE CACHE_FLUSH_TS | IRQ. (The A7XX form, event 0x31 with WRITE_ENABLED, is CACHE_INVALIDATE
+-     * here and writes no timestamp.) The timestamp goes to +4 (msm_rbmemptrs.fence), where wait() reads it. */
++    /* 5. a6xx_submit's fence: CP_EVENT_WRITE CACHE_FLUSH_TS | IRQ.
++     * The timestamp goes to +4 (msm_rbmemptrs.fence), where wait() reads it. */
+     const uint64_t at4=fence_iova_+4;
+     const uint32_t cache_flush[4]={RingCacheFlushTs|RingFenceIrq,(uint32_t)at4,(uint32_t)(at4>>32),seqno};
+     if(n)n=packet(words,n,RingEventWrite,cache_flush,4);
