@@ -1,0 +1,80 @@
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.cpp
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.cpp
+@@ -119,6 +119,12 @@
+     return board_gpu_context->bringUp(&io,bank,asid,slots,sids,progress,report);
+ }
++extern "C" IOReturn NativeAdrenoGpuScratchMaintain(int acquire)
++{
++    if(!board_gpu_context || !board_gpu_context->ready())return kIOReturnNotReady;
++    NativeAdrenoMemory &m=const_cast<NativeAdrenoMemory &>(board_gpu_context->buffer(4));
++    return acquire?m.acquireDeviceWrites(0,GpuPageBytes):m.publishForDevice(0,GpuPageBytes,true);
++}
+ extern "C" IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[5])
+ {
+     if(!out)return kIOReturnBadArgument;
+     for(unsigned i=0;i<GpuBufferCount;++i)out[i]={};
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -1,7 +1,52 @@
+ /* SPDX-License-Identifier: MIT */
+ #include "NativeAdrenoSubmit.h"
++#include "NativeAdrenoGpuContext.h"
++#include "NativeAdrenoMemory.h"
+ #include "AdrenoPM4.h"
+ #include <IOKit/IOLib.h>
++extern "C" IOReturn NativeAdrenoGpuScratchMaintain(int acquire);
++/* After fence 4 (the 16 KiB fill in pull47/pull49), copy 8 dwords from the fill BO and from three GMEM windows into the kernel scratch page.
++ * 0x11111111 left behind means CP_MEMCPY did not replace the sentinel. */
++static void probeGmemColor(NativeAdrenoRing *ring,NativeAdrenoVm *vm,const NativeAdrenoRingClock *clock,uint32_t fence)
++{
++    if(fence!=4 || !ring || !clock)return;
++    static bool done;
++    if(done)return;
++    done=true;
++    NativeAdrenoGpuBuffer bufs[5]={};
++    if(NativeAdrenoGpuContextBuffers(bufs)) {
++        IOLog("NativeAdrenoSubmit: GMEM probe fence %u scratch unavailable\n",fence);
++        return;
++    }
++    uint64_t surface=0;
++    if(vm)vm->firstLargeWritableImport(&surface);
++    const uint64_t srcs[4]={surface,UINT64_C(0x100000),UINT64_C(0x102000),UINT64_C(0x110000)};
++    const uint32_t off[4]={0x100,0x140,0x180,0x1c0};
++    uint32_t pm4[40];
++    unsigned n=0;
++    for(unsigned s=0;s<4;++s) {
++        const uint64_t dst=bufs[4].iova+off[s];
++        AdrenoPM4Type7(0x3d,3,&pm4[n]);
++        pm4[n+1]=(uint32_t)dst;pm4[n+2]=(uint32_t)(dst>>32);pm4[n+3]=0x11111111u;
++        n+=4;
++        AdrenoPM4Type7(0x75,5,&pm4[n]);
++        pm4[n+1]=8;
++        pm4[n+2]=(uint32_t)srcs[s];pm4[n+3]=(uint32_t)(srcs[s]>>32);
++        pm4[n+4]=(uint32_t)dst;pm4[n+5]=(uint32_t)(dst>>32);
++        n+=6;
++    }
++    const IOReturn published=NativeAdrenoGpuScratchMaintain(0);
++    uint32_t probeFence=0;
++    const IOReturn submitted=ring->submit(pm4,n,&probeFence);
++    const NativeAdrenoRingFence waited=submitted==kIOReturnSuccess?ring->wait(probeFence,clock,200000,nullptr):NativeAdrenoRingFenceArgument;
++    const IOReturn acquired=NativeAdrenoGpuScratchMaintain(1);
++    uint32_t w[4][4]={};
++    for(unsigned s=0;s<4;++s)for(unsigned k=0;k<4;++k)NativeAdrenoReadPhysicalWord(bufs[4].physical+off[s]+4u*k,&w[s][k]);
++    IOLog("NativeAdrenoSubmit: GMEM probe fence %u submit 0x%x wait %d publish 0x%x acquire 0x%x surface 0x%llx\n",
++        fence,(unsigned)submitted,(int)waited,(unsigned)published,(unsigned)acquired,(unsigned long long)surface);
++    IOLog("NativeAdrenoSubmit: GMEM probe surface %08x %08x %08x %08x gmem+0 %08x %08x %08x %08x gmem+8k %08x %08x %08x %08x gmem+64k %08x %08x %08x %08x\n",
++        w[0][0],w[0][1],w[0][2],w[0][3],w[1][0],w[1][1],w[1][2],w[1][3],w[2][0],w[2][1],w[2][2],w[2][3],w[3][0],w[3][1],w[3][2],w[3][3]);
++}
+ 
+ /* CP_INDIRECT_BUFFER is opcode 0x3f with a 3-word payload: 64-bit GPU address
+  * and IB_SIZE in dwords (bits 0..19), exactly as the pinned adreno_pm4.xml
+@@ -376,6 +421,7 @@
+     IOReturn status=release(*job);
+     if(status)return status;
+     ++stats_.completed;
++    probeGmemColor(ring_,vm_,clock,fence);
+     pokeImported(clock);   /* 0115 diagnostic */
+     vm_->reportSmmu(fence);   /* 0117 diagnostic */
+     reportPerfCounters(ring_, fence);   /* 0118 diagnostic */
