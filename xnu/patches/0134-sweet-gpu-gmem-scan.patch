@@ -1,0 +1,143 @@
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+@@ -101,6 +101,8 @@
+     /* NEXT AGENT (0115, diagnostic): the first mapping that is an imported, GPU-writable BO of at least 1 MiB (a render target / the screen's
+      * surface), or null; *iova is its GPU address. Used by NativeAdrenoSubmit::pokeImported. */
+     NativeAdrenoMemory *firstLargeWritableImport(uint64_t *iova) const;
++    /* GPU address of a writable BO whose first DRAM word is still the 0xA5A5A5A5 prefill. */
++    uint64_t prefillIova() const;
+     /* Diagnostic, never a proof of coherence: the 32-bit word at a mapped GPU address as the kernel's cacheable alias reads it
+      * and, when the board installed native_adreno_dram_read32, as DRAM reads it through an uncached mapping (else ~0). */
+     IOReturn sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dram) const;
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -469,6 +469,17 @@
+     }
+     return nullptr;
+ }
++uint64_t NativeAdrenoVm::prefillIova() const
++{
++    if(!attached_ || poisoned_)return 0;
++    for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
++        const Mapping &m=mappings_[i];
++        if(!m.memory || !(m.permissions&ArmSmmu4KWrite) || m.memory->bytes()<(1u<<20) || !m.memory->spanCount())continue;
++        uint32_t v=0;
++        if(NativeAdrenoReadPhysicalWord(m.memory->spans()[0].physical,&v) && v==0xa5a5a5a5u)return m.iova;
++    }
++    return 0;
++}
+ void NativeAdrenoVm::probeIova(uint64_t iova,uint32_t rem,uint32_t initSize,uint32_t roqRem,bool dumpAll) const
+ {
+     if(!attached_)return;
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.h
+@@ -51,6 +51,7 @@
+ /* The service's own GPU context, not the unused board bring-up object. */
+ extern "C" void NativeAdrenoGpuScratchBind(NativeAdrenoMemory *memory,uint64_t iova);
+ extern "C" uint64_t NativeAdrenoGpuScratchIova(void);
++extern "C" volatile uint32_t *NativeAdrenoGpuScratchWords(void);
+ extern "C" IOReturn NativeAdrenoGpuScratchMaintain(int acquire);
+ extern "C" IOReturn NativeAdrenoGpuScratchRead(uint32_t offset,uint32_t *value);
+ #endif
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.cpp
+@@ -129,6 +129,8 @@
+         memory?(unsigned long)memory->bytes():0,memory?(unsigned)memory->spanCount():0);
+ }
+ extern "C" uint64_t NativeAdrenoGpuScratchIova(void) {return live_scratch?live_scratch_iova:0;}
++extern "C" volatile uint32_t *NativeAdrenoGpuScratchWords(void)
++{return live_scratch && live_scratch->mapping()?static_cast<volatile uint32_t *>(live_scratch->mapping()):nullptr;}
+ extern "C" IOReturn NativeAdrenoGpuScratchMaintain(int acquire)
+ {
+     if(!live_scratch)return kIOReturnNotReady;
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -4,8 +4,24 @@
+ #include "NativeAdrenoMemory.h"
+ #include "AdrenoPM4.h"
+ #include <IOKit/IOLib.h>
+-/* After fence 4 (the 16 KiB fill in pull47/pull49), copy 8 dwords from the fill BO and from three GMEM windows into the kernel scratch page.
+- * 0x11111111 left behind means CP_MEMCPY did not replace the sentinel. */
++/* Copy dwords from a GPU address into the scratch page. The page is filled with 0x11111111 first, so a sentinel left behind means the copy did not write. */
++static int copyToScratch(NativeAdrenoRing *ring,const NativeAdrenoRingClock *clock,uint64_t scratch,volatile uint32_t *words,uint64_t src,uint32_t dwords)
++{
++    for(uint32_t i=0;i<dwords;++i)words[i]=0x11111111u;
++    const IOReturn published=NativeAdrenoGpuScratchMaintain(0);
++    uint32_t pm4[6];
++    AdrenoPM4Type7(0x75,5,&pm4[0]);
++    pm4[1]=dwords;pm4[2]=(uint32_t)src;pm4[3]=(uint32_t)(src>>32);pm4[4]=(uint32_t)scratch;pm4[5]=(uint32_t)(scratch>>32);
++    uint32_t probeFence=0;
++    const IOReturn submitted=ring->submit(pm4,6,&probeFence);
++    const int waited=submitted==kIOReturnSuccess?(int)ring->wait(probeFence,clock,200000,nullptr):(int)NativeAdrenoRingFenceArgument;
++    const IOReturn acquired=NativeAdrenoGpuScratchMaintain(1);
++    if(published || submitted || waited || acquired)
++        IOLog("NativeAdrenoSubmit: GMEM copy src 0x%llx dwords %u publish 0x%x submit 0x%x wait %d acquire 0x%x\n",
++            (unsigned long long)src,dwords,(unsigned)published,(unsigned)submitted,waited,(unsigned)acquired);
++    return waited;
++}
++/* After fence 4, copy the prefill BO (control) and every 4 KiB of the 512 KiB GMEM window into scratch. */
+ static void probeGmemColor(NativeAdrenoRing *ring,NativeAdrenoVm *vm,const NativeAdrenoRingClock *clock,uint32_t fence)
+ {
+     if(fence!=4 || !ring || !clock)return;
+@@ -13,38 +29,33 @@
+     if(done)return;
+     done=true;
+     const uint64_t scratch=NativeAdrenoGpuScratchIova();
+-    if(!scratch) {
++    volatile uint32_t *words=NativeAdrenoGpuScratchWords();
++    if(!scratch || !words) {
+         IOLog("NativeAdrenoSubmit: GMEM probe fence %u scratch unavailable\n",fence);
+         return;
+     }
+-    uint64_t surface=0;
+-    if(vm)vm->firstLargeWritableImport(&surface);
+-    const uint64_t srcs[4]={surface,UINT64_C(0x100000),UINT64_C(0x102000),UINT64_C(0x110000)};
+-    const uint32_t off[4]={0x100,0x140,0x180,0x1c0};
+-    uint32_t pm4[40];
+-    unsigned n=0;
+-    for(unsigned s=0;s<4;++s) {
+-        const uint64_t dst=scratch+off[s];
+-        AdrenoPM4Type7(0x3d,3,&pm4[n]);
+-        pm4[n+1]=(uint32_t)dst;pm4[n+2]=(uint32_t)(dst>>32);pm4[n+3]=0x11111111u;
+-        n+=4;
+-        AdrenoPM4Type7(0x75,5,&pm4[n]);
+-        pm4[n+1]=8;
+-        pm4[n+2]=(uint32_t)srcs[s];pm4[n+3]=(uint32_t)(srcs[s]>>32);
+-        pm4[n+4]=(uint32_t)dst;pm4[n+5]=(uint32_t)(dst>>32);
+-        n+=6;
++    const uint64_t surface=vm?vm->prefillIova():0;
++    const int controlWait=copyToScratch(ring,clock,scratch,words,surface,16);
++    IOLog("NativeAdrenoSubmit: GMEM probe control iova 0x%llx wait %d %08x %08x %08x %08x\n",
++        (unsigned long long)surface,controlWait,words[0],words[1],words[2],words[3]);
++    uint32_t sevens=0,sentinels=0,zeros=0,other=0,otherVal=0,hitIndex=0,otherIndex=0;
++    uint64_t hitSrc=0,otherSrc=0;
++    for(uint32_t off=0;off<0x80000u;off+=0x1000u) {
++        const uint64_t src=UINT64_C(0x100000)+off;
++        if(copyToScratch(ring,clock,scratch,words,src,1024)) {
++            IOLog("NativeAdrenoSubmit: GMEM probe scan stop src 0x%llx\n",(unsigned long long)src);
++            break;
++        }
++        for(uint32_t i=0;i<1024;++i) {
++            const uint32_t v=words[i];
++            if(v==0x7f7f7f7fu) {if(!sevens){hitSrc=src;hitIndex=i;}++sevens;}
++            else if(v==0x11111111u)++sentinels;
++            else if(!v)++zeros;
++            else {if(!other){otherSrc=src;otherIndex=i;otherVal=v;}++other;}
++        }
+     }
+-    const IOReturn published=NativeAdrenoGpuScratchMaintain(0);
+-    uint32_t probeFence=0;
+-    const IOReturn submitted=ring->submit(pm4,n,&probeFence);
+-    const NativeAdrenoRingFence waited=submitted==kIOReturnSuccess?ring->wait(probeFence,clock,200000,nullptr):NativeAdrenoRingFenceArgument;
+-    const IOReturn acquired=NativeAdrenoGpuScratchMaintain(1);
+-    uint32_t w[4][4]={};
+-    for(unsigned s=0;s<4;++s)for(unsigned k=0;k<4;++k)NativeAdrenoGpuScratchRead(off[s]+4u*k,&w[s][k]);
+-    IOLog("NativeAdrenoSubmit: GMEM probe fence %u submit 0x%x wait %d publish 0x%x acquire 0x%x surface 0x%llx\n",
+-        fence,(unsigned)submitted,(int)waited,(unsigned)published,(unsigned)acquired,(unsigned long long)surface);
+-    IOLog("NativeAdrenoSubmit: GMEM probe surface %08x %08x %08x %08x gmem+0 %08x %08x %08x %08x gmem+8k %08x %08x %08x %08x gmem+64k %08x %08x %08x %08x\n",
+-        w[0][0],w[0][1],w[0][2],w[0][3],w[1][0],w[1][1],w[1][2],w[1][3],w[2][0],w[2][1],w[2][2],w[2][3],w[3][0],w[3][1],w[3][2],w[3][3]);
++    IOLog("NativeAdrenoSubmit: GMEM probe scan sevens %u sentinels %u zeros %u other %u first7f 0x%llx+%u otherAt 0x%llx+%u word %08x\n",
++        sevens,sentinels,zeros,other,(unsigned long long)hitSrc,hitIndex,(unsigned long long)otherSrc,otherIndex,otherVal);
+ }
+ 
+ /* CP_INDIRECT_BUFFER is opcode 0x3f with a 3-word payload: 64-bit GPU address
