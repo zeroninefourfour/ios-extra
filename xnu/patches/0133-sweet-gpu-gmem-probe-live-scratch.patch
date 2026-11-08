@@ -1,0 +1,103 @@
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.h
+@@ -48,4 +48,9 @@
+ extern "C" IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[5]);
+ /* The live VM of the ready GPU context (null before Ready), for the user-client core. */
+ extern "C" NativeAdrenoVm *NativeAdrenoGpuContextVm();
++/* The service's own GPU context, not the unused board bring-up object. */
++extern "C" void NativeAdrenoGpuScratchBind(NativeAdrenoMemory *memory,uint64_t iova);
++extern "C" uint64_t NativeAdrenoGpuScratchIova(void);
++extern "C" IOReturn NativeAdrenoGpuScratchMaintain(int acquire);
++extern "C" IOReturn NativeAdrenoGpuScratchRead(uint32_t offset,uint32_t *value);
+ #endif
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoGpuContext.cpp
+@@ -1,5 +1,6 @@
+ /* SPDX-License-Identifier: MIT */
+ #include "NativeAdrenoGpuContext.h"
++#include "NativeAdrenoMemory.h"
+ #include "ArmSmmu4KMmio.h"
+ #include <IOKit/IOLib.h>
+ 
+@@ -119,11 +120,29 @@
+     const uint16_t sids[2]={uint16_t(sid0),uint16_t(sid1)};
+     return board_gpu_context->bringUp(&io,bank,asid,slots,sids,progress,report);
+ }
++static NativeAdrenoMemory *live_scratch;
++static uint64_t live_scratch_iova;
++extern "C" void NativeAdrenoGpuScratchBind(NativeAdrenoMemory *memory,uint64_t iova)
++{
++    live_scratch=memory;live_scratch_iova=memory?iova:0;
++    IOLog("NativeAdreno: scratch bound iova 0x%llx bytes 0x%lx spans %u\n",(unsigned long long)live_scratch_iova,
++        memory?(unsigned long)memory->bytes():0,memory?(unsigned)memory->spanCount():0);
++}
++extern "C" uint64_t NativeAdrenoGpuScratchIova(void) {return live_scratch?live_scratch_iova:0;}
+ extern "C" IOReturn NativeAdrenoGpuScratchMaintain(int acquire)
+ {
+-    if(!board_gpu_context || !board_gpu_context->ready())return kIOReturnNotReady;
+-    NativeAdrenoMemory &m=const_cast<NativeAdrenoMemory &>(board_gpu_context->buffer(4));
+-    return acquire?m.acquireDeviceWrites(0,GpuPageBytes):m.publishForDevice(0,GpuPageBytes,true);
++    if(!live_scratch)return kIOReturnNotReady;
++    return acquire?live_scratch->acquireDeviceWrites(0,GpuPageBytes):live_scratch->publishForDevice(0,GpuPageBytes,true);
++}
++extern "C" IOReturn NativeAdrenoGpuScratchRead(uint32_t offset,uint32_t *value)
++{
++    if(!live_scratch || !value)return kIOReturnNotReady;
++    for(size_t j=0;j<live_scratch->spanCount();++j) {
++        const NativeAdrenoPhysicalSpan &span=live_scratch->spans()[j];
++        if(offset<span.offset || (size_t)offset-span.offset+4>span.bytes)continue;
++        return NativeAdrenoReadPhysicalWord(span.physical+((size_t)offset-span.offset),value)?kIOReturnSuccess:kIOReturnIOError;
++    }
++    return kIOReturnBadArgument;
+ }
+ extern "C" IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[5])
+ {
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -4,7 +4,6 @@
+ #include "NativeAdrenoMemory.h"
+ #include "AdrenoPM4.h"
+ #include <IOKit/IOLib.h>
+-extern "C" IOReturn NativeAdrenoGpuScratchMaintain(int acquire);
+ /* After fence 4 (the 16 KiB fill in pull47/pull49), copy 8 dwords from the fill BO and from three GMEM windows into the kernel scratch page.
+  * 0x11111111 left behind means CP_MEMCPY did not replace the sentinel. */
+ static void probeGmemColor(NativeAdrenoRing *ring,NativeAdrenoVm *vm,const NativeAdrenoRingClock *clock,uint32_t fence)
+@@ -13,8 +12,8 @@
+     static bool done;
+     if(done)return;
+     done=true;
+-    NativeAdrenoGpuBuffer bufs[5]={};
+-    if(NativeAdrenoGpuContextBuffers(bufs)) {
++    const uint64_t scratch=NativeAdrenoGpuScratchIova();
++    if(!scratch) {
+         IOLog("NativeAdrenoSubmit: GMEM probe fence %u scratch unavailable\n",fence);
+         return;
+     }
+@@ -25,7 +24,7 @@
+     uint32_t pm4[40];
+     unsigned n=0;
+     for(unsigned s=0;s<4;++s) {
+-        const uint64_t dst=bufs[4].iova+off[s];
++        const uint64_t dst=scratch+off[s];
+         AdrenoPM4Type7(0x3d,3,&pm4[n]);
+         pm4[n+1]=(uint32_t)dst;pm4[n+2]=(uint32_t)(dst>>32);pm4[n+3]=0x11111111u;
+         n+=4;
+@@ -41,7 +40,7 @@
+     const NativeAdrenoRingFence waited=submitted==kIOReturnSuccess?ring->wait(probeFence,clock,200000,nullptr):NativeAdrenoRingFenceArgument;
+     const IOReturn acquired=NativeAdrenoGpuScratchMaintain(1);
+     uint32_t w[4][4]={};
+-    for(unsigned s=0;s<4;++s)for(unsigned k=0;k<4;++k)NativeAdrenoReadPhysicalWord(bufs[4].physical+off[s]+4u*k,&w[s][k]);
++    for(unsigned s=0;s<4;++s)for(unsigned k=0;k<4;++k)NativeAdrenoGpuScratchRead(off[s]+4u*k,&w[s][k]);
+     IOLog("NativeAdrenoSubmit: GMEM probe fence %u submit 0x%x wait %d publish 0x%x acquire 0x%x surface 0x%llx\n",
+         fence,(unsigned)submitted,(int)waited,(unsigned)published,(unsigned)acquired,(unsigned long long)surface);
+     IOLog("NativeAdrenoSubmit: GMEM probe surface %08x %08x %08x %08x gmem+0 %08x %08x %08x %08x gmem+8k %08x %08x %08x %08x gmem+64k %08x %08x %08x %08x\n",
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
+@@ -795,6 +795,7 @@
+         return false;
+     }
+ 
++    NativeAdrenoGpuScratchBind(const_cast<NativeAdrenoMemory *>(&gpu_ctx_->buffer(4)), GpuScratchIova);
+     /* Setup submit and core user clients */
+     execbuf_ = new NativeAdrenoSubmit;
+     core_ = new NativeAdrenoUserClient;
