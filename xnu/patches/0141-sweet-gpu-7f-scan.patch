@@ -1,0 +1,72 @@
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+@@ -129,6 +129,8 @@
+     /* Fill a mapped range with a sentinel before the GPU copies over it. */
+     void stamp(uint64_t iova,size_t bytes,uint32_t value);
+     void countCaptured(uint64_t iova,size_t bytes,uint32_t *sevens,uint32_t *zeros,uint32_t *sentinels,uint32_t *other,uint32_t *sample);
++    /* Diagnostic: after the fill, sample every writable mapping for 0x7f7f7f7f in DRAM (256 B stride). */
++    void scanWritableFor7f() const;
+     /* NEXT AGENT (0117, diagnostic, remove once the black screen is explained): this driver programs the GPU's SMMU context with
+      * stall_on_fault=0, so a GPU access to an unmapped or wrongly-permitted address is terminated silently (a write is dropped) and nothing
+      * logs it. Called when `fence` completes. Read-only (never clears a fault): logs the context bank's SCTLR/FSR/FSYNR0/FAR/TTBR0 and the
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -657,6 +657,48 @@
+         return;
+     }
+ }
++void NativeAdrenoVm::scanWritableFor7f() const
++{
++    static bool done;
++    if(done || !attached_ || poisoned_)return;
++    done=true;
++    uint32_t writable=0,samples=0,hits=0,slotsWithHits=0;
++    uint64_t firstIova=0,firstPa=0;
++    size_t firstOff=0,firstSlot=0;
++    for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
++        const Mapping &m=mappings_[i];
++        if(!m.memory || !(m.permissions&ArmSmmu4KWrite) || m.memory->bytes()<4096 || !m.memory->spanCount())continue;
++        ++writable;
++        (void)m.memory->acquireDeviceWrites(0,m.memory->bytes());
++        uint32_t slotHits=0;
++        const size_t scanEnd=m.memory->bytes()&~(size_t)3;
++        for(size_t o=0;o+4<=scanEnd;o+=256) {
++            const NativeAdrenoPhysicalSpan *span=nullptr;
++            for(size_t j=0;j<m.memory->spanCount();++j) {
++                const NativeAdrenoPhysicalSpan &s=m.memory->spans()[j];
++                if(o>=s.offset && o-s.offset+4<=s.bytes){span=&s;break;}
++            }
++            ++samples;
++            if(!span)continue;
++            uint32_t v=0;
++            const uint64_t pa=span->physical+(o-span->offset);
++            if(!NativeAdrenoReadPhysicalWord(pa,&v) || v!=0x7f7f7f7fu)continue;
++            ++slotHits;
++            ++hits;
++            if(!firstIova) {firstSlot=i;firstIova=m.iova+o;firstOff=o;firstPa=pa;}
++        }
++        if(slotHits) {
++            ++slotsWithHits;
++            const uint64_t pa0=m.memory->spans()[0].physical;
++            IOLog("NativeAdrenoVm: 7f scan slot %lu iova 0x%llx pa 0x%llx bytes 0x%lx hits %u imported %d\n",
++                (unsigned long)i,(unsigned long long)m.iova,(unsigned long long)pa0,(unsigned long)m.memory->bytes(),
++                slotHits,(int)m.memory->imported());
++        }
++    }
++    IOLog("NativeAdrenoVm: 7f scan writable %u samples %u hits %u slots %u first slot %lu off 0x%lx iova 0x%llx pa 0x%llx\n",
++        writable,samples,hits,slotsWithHits,(unsigned long)firstSlot,(unsigned long)firstOff,
++        (unsigned long long)firstIova,(unsigned long long)firstPa);
++}
+ IOReturn NativeAdrenoVm::reassertWriteCombined(uint32_t *reset) const
+ {
+     if(!reset)return kIOReturnBadArgument;
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -49,6 +49,7 @@
+     const uint64_t dest=native_adreno_gmem_capture_iova;
+     if(vm && dest && chunks)vm->countCaptured(dest+UINT64_C(0x100000),(size_t)chunks*0x1000u,&sevens,&zeros,&sentinels,&other,&sample);
+     IOLog("NativeAdrenoSubmit: GMEM capture chunks %u sevens %u zeros %u sentinels %u other %u sample %08x\n",chunks,sevens,zeros,sentinels,other,sample);
++    if(vm)vm->scanWritableFor7f();
+ }
+ 
+ /* CP_INDIRECT_BUFFER is opcode 0x3f with a 3-word payload: 64-bit GPU address
