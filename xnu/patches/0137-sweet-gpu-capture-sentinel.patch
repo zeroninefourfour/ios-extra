@@ -1,0 +1,101 @@
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+@@ -126,7 +126,9 @@
+     unsigned nopCcuFlush(uint64_t iova,size_t bytes);
+     /* After a CP_BLIT in this IB, append 4 KiB GMEM copies into the spare BO bytes. Returns how many chunks were appended. */
+     unsigned captureGmem(uint64_t iova,size_t bytes,uint64_t destIova);
+-    void countCaptured(uint64_t iova,size_t bytes,uint32_t *sevens,uint32_t *zeros,uint32_t *other,uint32_t *sample);
++    /* Fill a mapped range with a sentinel before the GPU copies over it. */
++    void stamp(uint64_t iova,size_t bytes,uint32_t value);
++    void countCaptured(uint64_t iova,size_t bytes,uint32_t *sevens,uint32_t *zeros,uint32_t *sentinels,uint32_t *other,uint32_t *sample);
+     /* NEXT AGENT (0117, diagnostic, remove once the black screen is explained): this driver programs the GPU's SMMU context with
+      * stall_on_fault=0, so a GPU access to an unmapped or wrongly-permitted address is terminated silently (a write is dropped) and nothing
+      * logs it. Called when `fence` completes. Read-only (never clears a fault): logs the context bank's SCTLR/FSR/FSYNR0/FAR/TTBR0 and the
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -616,10 +616,24 @@
+     }
+     return 0;
+ }
+-void NativeAdrenoVm::countCaptured(uint64_t iova,size_t bytes,uint32_t *sevens,uint32_t *zeros,uint32_t *other,uint32_t *sample)
++void NativeAdrenoVm::stamp(uint64_t iova,size_t bytes,uint32_t value)
+ {
+-    if(sevens)*sevens=0;if(zeros)*zeros=0;if(other)*other=0;if(sample)*sample=0;
+-    if(!attached_ || poisoned_ || !sevens || !zeros || !other || !sample || !bytes || (iova&3))return;
++    if(!attached_ || poisoned_ || !bytes || (bytes&3) || (iova&3))return;
++    for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
++        const Mapping &m=mappings_[i];
++        if(!m.memory || !m.memory->mapping() || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
++        size_t offset=(size_t)(iova-m.iova);
++        size_t end=offset+bytes;
++        if(end>m.memory->bytes())end=m.memory->bytes();
++        volatile uint32_t *w=static_cast<volatile uint32_t *>(m.memory->mapping());
++        for(size_t o=offset;o+4<=end;o+=4)w[o/4]=value;
++        return;
++    }
++}
++void NativeAdrenoVm::countCaptured(uint64_t iova,size_t bytes,uint32_t *sevens,uint32_t *zeros,uint32_t *sentinels,uint32_t *other,uint32_t *sample)
++{
++    if(sevens)*sevens=0;if(zeros)*zeros=0;if(sentinels)*sentinels=0;if(other)*other=0;if(sample)*sample=0;
++    if(!attached_ || poisoned_ || !sevens || !zeros || !sentinels || !other || !sample || !bytes || (iova&3))return;
+     for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
+         const Mapping &m=mappings_[i];
+         if(!m.memory || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
+@@ -637,6 +651,7 @@
+             if(!span || !NativeAdrenoReadPhysicalWord(span->physical+(o-span->offset),&v))continue;
+             if(v==0x7f7f7f7fu)++*sevens;
+             else if(!v)++*zeros;
++            else if(v==0x22222222u)++*sentinels;
+             else {if(!*other)*sample=v;++*other;}
+         }
+         return;
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -39,11 +39,11 @@
+     const int controlWait=copyToScratch(ring,clock,scratch,words,surface,16);
+     IOLog("NativeAdrenoSubmit: GMEM probe control iova 0x%llx wait %d %08x %08x %08x %08x\n",
+         (unsigned long long)surface,controlWait,words[0],words[1],words[2],words[3]);
+-    uint32_t sevens=0,zeros=0,other=0,sample=0;
++    uint32_t sevens=0,zeros=0,sentinels=0,other=0,sample=0;
+     const uint32_t chunks=native_adreno_gmem_capture_chunks;
+     const uint64_t dest=native_adreno_gmem_capture_iova;
+-    if(vm && dest && chunks)vm->countCaptured(dest+UINT64_C(0x100000),(size_t)chunks*0x1000u,&sevens,&zeros,&other,&sample);
+-    IOLog("NativeAdrenoSubmit: GMEM capture chunks %u sevens %u zeros %u other %u sample %08x\n",chunks,sevens,zeros,other,sample);
++    if(vm && dest && chunks)vm->countCaptured(dest+UINT64_C(0x100000),(size_t)chunks*0x1000u,&sevens,&zeros,&sentinels,&other,&sample);
++    IOLog("NativeAdrenoSubmit: GMEM capture chunks %u sevens %u zeros %u sentinels %u other %u sample %08x\n",chunks,sevens,zeros,sentinels,other,sample);
+ }
+ 
+ /* CP_INDIRECT_BUFFER is opcode 0x3f with a 3-word payload: 64-bit GPU address
+@@ -249,6 +249,7 @@
+         }
+     }
+     (void)vm_->sampleWord(buffers[0].iova,&cached,&before);
++    uint64_t captureAppend=0;
+     if(ring_->lastSubmitted()+1==4) {
+         unsigned hits=0,chunks=0;
+         const uint64_t dest=vm_->prefillIova();
+@@ -256,13 +257,23 @@
+         for(size_t i=0;i<count;++i) {
+             hits+=vm_->nopCcuFlush(buffers[i].iova,buffers[i].bytes);
+             const unsigned added=dest?vm_->captureGmem(buffers[i].iova,buffers[i].bytes,dest):0;
+-            if(added){words[sizeAt[i]]+=added*6u;chunks+=added;}
++            if(added){
++                words[sizeAt[i]]+=added*6u;chunks+=added;
++                if(!captureAppend)captureAppend=buffers[i].iova+buffers[i].bytes;
++            }
+         }
++        if(dest && chunks)vm_->stamp(dest+UINT64_C(0x100000),(size_t)chunks*0x1000u,0x22222222u);
+         native_adreno_gmem_capture_chunks=chunks;
+         IOLog("NativeAdrenoSubmit: CCU flush nop fence 4 hits %u capture chunks %u dest 0x%llx\n",hits,chunks,(unsigned long long)dest);
+     }
+     IOReturn status=vm_->publishMapped();
+     if(!status) {
++        if(captureAppend) {
++            uint32_t head=0,stampCached=0,stampDram=0;
++            (void)vm_->peekWords(captureAppend,&head,1);
++            (void)vm_->sampleWord(native_adreno_gmem_capture_iova+UINT64_C(0x100000),&stampCached,&stampDram);
++            IOLog("NativeAdrenoSubmit: capture armed head %08x dram %08x cached %08x\n",head,stampDram,stampCached);
++        }
+         (void)vm_->sampleWord(buffers[0].iova,&ignored,&after);
+         native_adreno_coherence[0]=native_adreno_coherence[0]+1;
+         native_adreno_coherence[1]=cached;native_adreno_coherence[2]=before;native_adreno_coherence[3]=after;
