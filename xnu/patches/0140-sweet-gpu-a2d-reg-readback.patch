@@ -1,0 +1,93 @@
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+@@ -124,8 +124,6 @@
+     IOReturn peekWords(uint64_t iova,uint32_t *out,size_t count) const;
+     /* Replace CP_EVENT_WRITE CCU color/depth flushes in this IB with NOPs. Returns how many packets changed. */
+     unsigned nopCcuFlush(uint64_t iova,size_t bytes);
+-    /* The 4096x1 fill leaves RB_A2D_DEST_BUFFER_PITCH at 0. Write the 16 KiB row pitch. Returns 1 if changed. */
+-    unsigned rewriteFillPitch(uint64_t iova,size_t bytes);
+     /* After a CP_BLIT in this IB, append 4 KiB GMEM copies into the spare BO bytes. Returns how many chunks were appended. */
+     unsigned captureGmem(uint64_t iova,size_t bytes,uint64_t destIova);
+     /* Fill a mapped range with a sentinel before the GPU copies over it. */
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -586,28 +586,6 @@
+     }
+     return 0;
+ }
+-unsigned NativeAdrenoVm::rewriteFillPitch(uint64_t iova,size_t bytes)
+-{
+-    if(!attached_ || poisoned_ || !bytes || (bytes&3) || (iova&3))return 0;
+-    for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
+-        const Mapping &m=mappings_[i];
+-        if(!m.memory || !m.memory->mapping() || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
+-        const size_t offset=(size_t)(iova-m.iova);
+-        if(offset+bytes>m.memory->bytes())return 0;
+-        volatile uint32_t *w=static_cast<volatile uint32_t *>(m.memory->mapping())+offset/4;
+-        const size_t n=bytes/4;
+-        bool fill=false;
+-        for(size_t k=0;k<n && !fill;++k)if(w[k]==0x7f7f7f7fu)fill=true;
+-        if(!fill)return 0;
+-        for(size_t k=0;k+4<n;++k) {
+-            if(w[k]!=0x408c1704u || w[k+1]!=0x4bu || w[k+4]!=0)continue;
+-            w[k+4]=0x100u;
+-            return 1;
+-        }
+-        return 0;
+-    }
+-    return 0;
+-}
+ unsigned NativeAdrenoVm::captureGmem(uint64_t iova,size_t bytes,uint64_t destIova)
+ {
+     if(!attached_ || poisoned_ || !destIova || !bytes || (bytes&3) || (iova&3))return 0;
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -29,6 +29,11 @@
+     static bool done;
+     if(done)return;
+     done=true;
++    uint32_t protect=0,ccu=0,blt=0,baseLo=0,baseHi=0,pitch=0,clear=0;
++    const bool live=ring->readReg(0x0824,&protect) & ring->readReg(0x8e07,&ccu) & ring->readReg(0x8c00,&blt) &
++        ring->readReg(0x8c18,&baseLo) & ring->readReg(0x8c19,&baseHi) & ring->readReg(0x8c1a,&pitch) & ring->readReg(0x8c2c,&clear);
++    IOLog("NativeAdrenoSubmit: A2D live %s protect %08x ccu %08x blt %08x base %08x:%08x pitch %08x clear %08x\n",
++        live?"ok":"READ FAILED",protect,ccu,blt,baseHi,baseLo,pitch,clear);
+     const uint64_t scratch=NativeAdrenoGpuScratchIova();
+     volatile uint32_t *words=NativeAdrenoGpuScratchWords();
+     if(!scratch || !words) {
+@@ -249,11 +254,6 @@
+         }
+     }
+     (void)vm_->sampleWord(buffers[0].iova,&cached,&before);
+-    if(ring_->lastSubmitted()+1==4) {
+-        unsigned pitches=0;
+-        for(size_t i=0;i<count;++i)pitches+=vm_->rewriteFillPitch(buffers[i].iova,buffers[i].bytes);
+-        IOLog("NativeAdrenoSubmit: fill pitch rewritten %u\n",pitches);
+-    }
+     IOReturn status=vm_->publishMapped();
+     if(!status) {
+         (void)vm_->sampleWord(buffers[0].iova,&ignored,&after);
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.h
+@@ -98,6 +98,8 @@
+     bool readIb1(uint64_t *base,uint32_t *rem,uint32_t *initSize=nullptr,uint32_t *roqRem=nullptr);   /* 0113: initSize = CP_IB1_INIT_SIZE (0x943) */
+     /* Diagnostic (0118): read RB and CCU 64-bit performance counters (lower 32 bits). false when a register read failed. */
+     bool readPerfCounters(uint32_t *rb2d,uint32_t *rb3d,uint32_t *ccu2d,uint32_t *ccuColor);
++    /* One MMIO register. False when the read fails. */
++    bool readReg(uint32_t reg,uint32_t *value) const;
+     uint32_t submissions() const {return submissions_;}
+     uint32_t readPointer() const {return rptr_shadow_;}
+ };
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+@@ -282,6 +282,11 @@
+     if(ccuColor)*ccuColor=cc;
+     return true;
+ }
++bool NativeAdrenoRing::readReg(uint32_t reg,uint32_t *value) const
++{
++    if(!value || !attached_ || !io_.read32)return false;
++    return !io_.read32(io_.cookie,reg,value);
++}
+ NativeAdrenoRingFence NativeAdrenoRing::wait(uint32_t fence,const NativeAdrenoRingClock *clock,
+     uint32_t timeout_us,uint32_t *observed)
+ {
