@@ -1,0 +1,62 @@
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+@@ -124,8 +124,8 @@
+     IOReturn peekWords(uint64_t iova,uint32_t *out,size_t count) const;
+     /* Replace CP_EVENT_WRITE CCU color/depth flushes in this IB with NOPs. Returns how many packets changed. */
+     unsigned nopCcuFlush(uint64_t iova,size_t bytes);
+-    /* Put CP_WAIT_FOR_IDLE between CP_BLIT SCALE and the following CCU flush. Returns 1 if inserted. */
+-    unsigned insertBlitWfi(uint64_t iova,size_t bytes);
++    /* The 4096x1 fill leaves RB_A2D_DEST_BUFFER_PITCH at 0. Write the 16 KiB row pitch. Returns 1 if changed. */
++    unsigned rewriteFillPitch(uint64_t iova,size_t bytes);
+     /* After a CP_BLIT in this IB, append 4 KiB GMEM copies into the spare BO bytes. Returns how many chunks were appended. */
+     unsigned captureGmem(uint64_t iova,size_t bytes,uint64_t destIova);
+     /* Fill a mapped range with a sentinel before the GPU copies over it. */
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -586,7 +586,7 @@
+     }
+     return 0;
+ }
+-unsigned NativeAdrenoVm::insertBlitWfi(uint64_t iova,size_t bytes)
++unsigned NativeAdrenoVm::rewriteFillPitch(uint64_t iova,size_t bytes)
+ {
+     if(!attached_ || poisoned_ || !bytes || (bytes&3) || (iova&3))return 0;
+     for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
+@@ -596,13 +596,12 @@
+         if(offset+bytes>m.memory->bytes())return 0;
+         volatile uint32_t *w=static_cast<volatile uint32_t *>(m.memory->mapping())+offset/4;
+         const size_t n=bytes/4;
+-        for(size_t k=0;k+2<n;++k) {
+-            if(w[k]!=0x702c0001u || w[k+1]!=3u || w[k+2]!=0x70460004u)continue;
+-            if(offset+bytes+4>m.memory->bytes())return 0;
+-            uint32_t header=0;
+-            if(AdrenoPM4Type7(0x26,0,&header)!=AdrenoPM4Success)return 0;
+-            for(size_t t=n;t>k+2;--t)w[t]=w[t-1];
+-            w[k+2]=header;
++        bool fill=false;
++        for(size_t k=0;k<n && !fill;++k)if(w[k]==0x7f7f7f7fu)fill=true;
++        if(!fill)return 0;
++        for(size_t k=0;k+4<n;++k) {
++            if(w[k]!=0x408c1704u || w[k+1]!=0x4bu || w[k+4]!=0)continue;
++            w[k+4]=0x100u;
+             return 1;
+         }
+         return 0;
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -250,12 +250,9 @@
+     }
+     (void)vm_->sampleWord(buffers[0].iova,&cached,&before);
+     if(ring_->lastSubmitted()+1==4) {
+-        unsigned inserted=0;
+-        for(size_t i=0;i<count;++i) {
+-            const unsigned added=vm_->insertBlitWfi(buffers[i].iova,buffers[i].bytes);
+-            if(added){words[sizeAt[i]]+=added;inserted+=added;}
+-        }
+-        IOLog("NativeAdrenoSubmit: blit WFI inserted %u\n",inserted);
++        unsigned pitches=0;
++        for(size_t i=0;i<count;++i)pitches+=vm_->rewriteFillPitch(buffers[i].iova,buffers[i].bytes);
++        IOLog("NativeAdrenoSubmit: fill pitch rewritten %u\n",pitches);
+     }
+     IOReturn status=vm_->publishMapped();
+     if(!status) {
