@@ -1,0 +1,67 @@
+diff --git a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -346,6 +346,50 @@
+         }
+     }
+     return kIOReturnSuccess;
++}
++/* One live translation of a sampled BO: the CPU table leaf, the same descriptor read from DRAM, the context bank TTBR, and the
++ * table root. The BO's own span is the page acquireImported samples. */
++static void logLiveTranslation(const NativeAdrenoVmRegion &region,const ArmSmmu4KIo &io,unsigned slot,uint64_t iova,uint64_t spanPa)
++{
++    const ArmSmmu4KLiveArena *arena=region.arena;
++    const ArmSmmu4KLiveState *state=region.state;
++    if(!arena || !arena->mapping || !state || arena->config.input_bits<32 || arena->config.input_bits>48) {
++        IOLog("NativeAdrenoVm: PTE slot %u iova 0x%llx span 0x%llx walk absent\n",slot,(unsigned long long)iova,(unsigned long long)spanPa);
++        return;
++    }
++    const unsigned bits=arena->config.input_bits;
++    const unsigned start=4-(bits-12+8)/9;
++    const uint64_t pool=arena->config.table_physical;
++    const size_t words=arena->capacity_pages*512;
++    size_t table=0;
++    bool ok=true;
++    uint64_t stopped=0;
++    for(unsigned level=start;level<3 && ok;++level) {
++        const unsigned shift=39-9*level;
++        const unsigned width=level==start?bits-shift:9;
++        const size_t index=table*512+((iova>>shift)&((1u<<width)-1));
++        if(index>=words) {ok=false;stopped=index;break;}
++        const uint64_t entry=arena->mapping[index];
++        const uint64_t next=entry&UINT64_C(0x0000fffffffff000);
++        if((entry&3u)!=3u || next<pool || ((next-pool)/4096)>=arena->capacity_pages) {ok=false;stopped=entry;break;}
++        table=(size_t)((next-pool)/4096);
++    }
++    uint64_t leaf=0,leafPa=0;
++    if(ok) {
++        const size_t index=table*512+((iova>>12)&511u);
++        if(index>=words) ok=false;
++        else {leaf=arena->mapping[index];leafPa=pool+index*8;}
++    }
++    uint32_t dramLo=0,dramHi=0;
++    const bool dram=ok && NativeAdrenoReadPhysicalWord(leafPa,&dramLo) && NativeAdrenoReadPhysicalWord(leafPa+4,&dramHi);
++    const uint64_t dramLeaf=dram?(uint64_t)dramLo|((uint64_t)dramHi<<32):0;
++    uint64_t ttbr=0;
++    if(state->context_offset && io.read64)(void)io.read64(io.cookie,(size_t)state->context_offset+0x20,&ttbr);
++    IOLog("NativeAdrenoVm: PTE slot %u iova 0x%llx leaf 0x%llx dram 0x%llx pa 0x%llx span 0x%llx ttbr 0x%llx root 0x%llx %s\n",
++        slot,(unsigned long long)iova,(unsigned long long)leaf,(unsigned long long)dramLeaf,
++        (unsigned long long)(leaf&UINT64_C(0x0000fffffffff000)),(unsigned long long)spanPa,(unsigned long long)ttbr,
++        (unsigned long long)state->tables.root_physical,ok?"ok":"WALK FAILED");
++    if(!ok) IOLog("NativeAdrenoVm: PTE slot %u iova 0x%llx stopped 0x%llx\n",slot,(unsigned long long)iova,(unsigned long long)stopped);
+ }
+ IOReturn NativeAdrenoVm::acquireImported()
+ {
+@@ -405,6 +449,12 @@
+                         (unsigned long)i,(unsigned long long)m.iova,(unsigned long)foundOff,(unsigned long long)foundPa,
+                         q[0],q[1],q[2],q[3]);
+                 }
++                if(reports<=16) {
++                    const uint64_t spanPa=m.memory->spanCount()?m.memory->spans()[0].physical:0;
++                    unsigned which=0;
++                    if(regions_[0].arena && m.iova>=(UINT64_C(1)<<regions_[0].arena->config.input_bits)) which=1;
++                    logLiveTranslation(regions_[which],io_,(unsigned)i,m.iova,spanPa);
++                }
+             }
+         }
+     }
