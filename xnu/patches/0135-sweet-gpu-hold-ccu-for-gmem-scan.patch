@@ -1,0 +1,86 @@
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+@@ -122,6 +122,8 @@
+     IOReturn describe(uint64_t handle,uint64_t *iova,size_t *bytes,unsigned *permissions) const;
+     /* Up to `count` dwords of a mapped kernel-owned BO at a GPU address (through the kernel's own mapping), for the board log. */
+     IOReturn peekWords(uint64_t iova,uint32_t *out,size_t count) const;
++    /* Replace CP_EVENT_WRITE CCU color/depth flushes in this IB with NOPs. Returns how many packets changed. */
++    unsigned nopCcuFlush(uint64_t iova,size_t bytes);
+     /* NEXT AGENT (0117, diagnostic, remove once the black screen is explained): this driver programs the GPU's SMMU context with
+      * stall_on_fault=0, so a GPU access to an unmapped or wrongly-permitted address is terminated silently (a write is dropped) and nothing
+      * logs it. Called when `fence` completes. Read-only (never clears a fault): logs the context bank's SCTLR/FSR/FSYNR0/FAR/TTBR0 and the
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: MIT */
+ #include "NativeAdrenoVm.h"
+ #include "NativeAdrenoVmAlias.h"
++#include "AdrenoPM4.h"
+ extern "C" volatile uint32_t native_adreno_trace_stage;
+ extern "C" {int (*native_adreno_dram_read32)(uint64_t,uint32_t *);int (*native_adreno_cached_read32)(uint64_t,uint32_t *);
+     int (*native_adreno_line_audit)(uint64_t,size_t,uint32_t *,uint32_t *);}
+@@ -563,6 +564,28 @@
+     }
+     return kIOReturnBadArgument;
+ }
++unsigned NativeAdrenoVm::nopCcuFlush(uint64_t iova,size_t bytes)
++{
++    if(!attached_ || poisoned_ || !bytes || (bytes&3) || (iova&3))return 0;
++    for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
++        const Mapping &m=mappings_[i];
++        if(!m.memory || !m.memory->mapping() || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
++        const size_t offset=(size_t)(iova-m.iova);
++        if(offset+bytes>m.memory->bytes())return 0;
++        volatile uint32_t *w=static_cast<volatile uint32_t *>(m.memory->mapping())+offset/4;
++        const size_t n=bytes/4;
++        unsigned hits=0;
++        for(size_t k=0;k+4<n;++k) {
++            if(w[k]!=0x70460004u || (w[k+1]!=0x1du && w[k+1]!=0x1cu))continue;
++            uint32_t header=0;
++            if(AdrenoPM4Type7(0x10,4,&header)!=AdrenoPM4Success)break;
++            w[k]=header;w[k+1]=w[k+2]=w[k+3]=w[k+4]=0;
++            ++hits;k+=4;
++        }
++        return hits;
++    }
++    return 0;
++}
+ IOReturn NativeAdrenoVm::reassertWriteCombined(uint32_t *reset) const
+ {
+     if(!reset)return kIOReturnBadArgument;
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+@@ -122,9 +122,17 @@
+      * memptrs[2] receives seqno upon CCU color flush completion. */
+     const uint64_t ccu_ts_addr=fence_iova_+8;
+     const uint32_t ccu_color[4]={RingCcuFlushColorTs,(uint32_t)ccu_ts_addr,(uint32_t)(ccu_ts_addr>>32),seqno};
+-    if(n)n=packet(words,n,RingEventWrite,ccu_color,4);
+     const uint32_t ccu_depth[4]={RingCcuFlushDepthTs,(uint32_t)ccu_ts_addr,(uint32_t)(ccu_ts_addr>>32),seqno};
+-    if(n)n=packet(words,n,RingEventWrite,ccu_depth,4);
++    const uint32_t nop[4]={0,0,0,0};
++    /* Fence 4 is the fill. Leave its CCU lines in place so the GMEM scan can see them. */
++    if(seqno==4) {
++        if(n)n=packet(words,n,0x10,nop,4);
++        if(n)n=packet(words,n,0x10,nop,4);
++        IOLog("NativeAdrenoRing: fence %u CCU flush suppressed\n",seqno);
++    } else {
++        if(n)n=packet(words,n,RingEventWrite,ccu_color,4);
++        if(n)n=packet(words,n,RingEventWrite,ccu_depth,4);
++    }
+     /* 3. Wait for the CCU writeback to reach DRAM before the fence. Do not
+      * invalidate CCU or UCHE here: on A618 that drops the lines the flush
+      * just wrote. The next submission's prologue invalidates. */
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -259,6 +259,11 @@
+         }
+     }
+     (void)vm_->sampleWord(buffers[0].iova,&cached,&before);
++    if(ring_->lastSubmitted()+1==4) {
++        unsigned hits=0;
++        for(size_t i=0;i<count;++i)hits+=vm_->nopCcuFlush(buffers[i].iova,buffers[i].bytes);
++        IOLog("NativeAdrenoSubmit: CCU flush nop fence 4 hits %u\n",hits);
++    }
+     IOReturn status=vm_->publishMapped();
+     if(!status) {
+         (void)vm_->sampleWord(buffers[0].iova,&ignored,&after);
