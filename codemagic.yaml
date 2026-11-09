@@ -1,0 +1,254 @@
+# Manual XNU build. No `triggering` section: Codemagic starts this only from
+# "Start new build" (or the REST API). Do not add push, pull_request, or tag
+# events. No `publishing` section and no signing: unsigned kernel artifacts only.
+#
+# Image pin (https://docs.codemagic.io/specs-macos/xcode-16-0/):
+#   xcode: "16.0" -> Xcode 16.0 (16A242d) at /Applications/Xcode-16.0.app
+#   on macOS 14.7 (23H124), Darwin 23.6.0.
+#   instance_type: mac_mini_m2 -> Apple silicon M2, 8-core / 12GB (free tier).
+# Xcode 16.1 and later on Codemagic are macOS 15 images. Do not select them:
+# macOS 15 breaks this iOS 16 tree. "latest" and an unpinned "16" are rejected
+# for the same reason. The env script fails the build if the VM is not macOS 14
+# or Xcode is not 16.0.x.
+#
+# Same steps as .circleci/config.yml / .github/workflows/xnu.yml, including
+# buildtree.tgz and out/ (kernels, SHA256SUMS, perf/). build.sh downloads the
+# public KDK for MACOS_VERSION; no Apple ID or certificate.
+#
+# Known toolchain mismatch, still compiled as requested: xnu-8796's IORPC ABI
+# wants an Xcode 15 iig. Xcode 16's iig emits IORPC.kernelContent, which this
+# xnu lacks. The env script prints that and continues.
+#
+# max_build_duration is 60 minutes (Codemagic's default; yaml maximum is 120).
+# Cached CircleCI runs of this kernel on m4pro.medium were about 4 minutes
+# (build 35, 244913 ms). Sixty minutes covers a cold ccache plus the KDK
+# download on this smaller machine. This file was checked against
+# https://codemagic.io/codemagic-schema.json and was not run on macOS.
+
+workflows:
+  xnu-kernel:
+    name: XNU kernel (manual, macOS 14.7 / Xcode 16.0 / M2)
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    inputs:
+      macos_version:
+        description: macOS release whose xnu to build (13.5 = xnu-8796, iOS 16 era)
+        type: string
+        default: "13.5"
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        type: choice
+        options:
+          - RELEASE
+          - DEVELOPMENT
+          - DEBUG
+        default: DEVELOPMENT
+      machine_config:
+        description: xnu MACHINE_CONFIG
+        type: string
+        default: SWEET
+      keep_going:
+        description: make -k (collect all compile errors in one run)
+        type: boolean
+        default: true
+      use_ccache:
+        description: compile through ccache (false = from-scratch if a cached object is suspected)
+        type: boolean
+        default: true
+    environment:
+      xcode: "16.0"
+      vars:
+        DXB_REPO: "https://github.com/blacktop/darwin-xnu-build"
+        DXB_SHA: "663906528d1cd5ea8fde7de6f16de73db9511549"
+        MACOS_VERSION: "${{ inputs.macos_version }}"
+        KERNEL_CONFIG: "${{ inputs.kernel_config }}"
+        MACHINE_CONFIG: "${{ inputs.machine_config }}"
+        USE_CCACHE: "${{ inputs.use_ccache }}"
+        KEEP_GOING: "${{ inputs.keep_going }}"
+        # preprocessor mode (no direct mode) hashes the preprocessed source, so a fresh
+        # checkout's mtimes cannot cause a stale hit; the compiler is hashed by content
+        CCACHE_NODIRECT: "1"
+        CCACHE_COMPILERCHECK: content
+        CCACHE_MAXSIZE: 1G
+    cache:
+      cache_paths:
+        - $CM_BUILD_DIR/.ccache
+    scripts:
+      - name: Environment (Xcode 16.0 on macOS 14, ccache paths)
+        script: |
+          set -euo pipefail
+          XCODE_APP="/Applications/Xcode-16.0.app"
+          if [ ! -d "$XCODE_APP" ]; then
+            echo "Xcode 16.0 not found at $XCODE_APP"
+            ls -d /Applications/Xcode*.app || true
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE_APP"
+          export DEVELOPER_DIR="$XCODE_APP/Contents/Developer"
+          PRODUCT="$(sw_vers -productVersion)"
+          echo "macOS $PRODUCT"
+          sw_vers
+          uname -m
+          sysctl -n hw.model || true
+          sysctl -n hw.memsize || true
+          xcodebuild -version
+          case "$PRODUCT" in
+            14.*) ;;
+            *)
+              echo "Refusing build: need macOS 14 (Codemagic Xcode 16.0 image is 14.7). Got $PRODUCT"
+              exit 1
+              ;;
+          esac
+          XB="$(xcodebuild -version | awk 'NR==1 {print $2}')"
+          case "$XB" in
+            16.0*) ;;
+            *)
+              echo "Refusing build: need Xcode 16.0.x. Later 16.x images are macOS 15. Got $XB"
+              exit 1
+              ;;
+          esac
+          echo "NOTE: xnu-8796 needs an Xcode 15 iig. Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks. build.sh still runs on this image."
+          xcrun --find iig
+          case "${USE_CCACHE:-true}" in
+            true|True|TRUE) USE_CCACHE=true ;;
+            *) USE_CCACHE=false ;;
+          esac
+          case "${KEEP_GOING:-true}" in
+            true|True|TRUE) KEEP_GOING=true ;;
+            *) KEEP_GOING=false ;;
+          esac
+          mkdir -p "$CM_BUILD_DIR/.ccache"
+          {
+            echo "DEVELOPER_DIR=$DEVELOPER_DIR"
+            echo "CCACHE_DIR=$CM_BUILD_DIR/.ccache"
+            echo "CCACHE_BASEDIR=$CM_BUILD_DIR"
+            echo "USE_CCACHE=$USE_CCACHE"
+            echo "KEEP_GOING=$KEEP_GOING"
+          } >> "$CM_ENV"
+          echo "MACOS_VERSION=$MACOS_VERSION KERNEL_CONFIG=$KERNEL_CONFIG MACHINE_CONFIG=$MACHINE_CONFIG USE_CCACHE=$USE_CCACHE KEEP_GOING=$KEEP_GOING"
+
+      - name: Fetch build script
+        script: |
+          set -euo pipefail
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
+          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          ls dxb/patches
+
+      - name: Deps
+        script: |
+          set -euo pipefail
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          export HOMEBREW_NO_ANALYTICS=1
+          brew install jq gum bash cmake ninja ccache
+          # build.sh only checks that xcodes exists (Xcode is preinstalled)
+          sudo mkdir -p /usr/local/bin
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          sw_vers
+          xcodebuild -version
+          xcrun --find iig
+
+      # Record build.sh's status and keep going, so packaging still runs.
+      # The last script fails the workflow when the build failed.
+      # ignore_failure on the post-build steps matches CircleCI `when: always`.
+      - name: Build
+        ignore_failure: true
+        script: |
+          #!/bin/bash
+          set -euo pipefail
+          cd dxb
+          if [ "$USE_CCACHE" = true ]; then
+            export CCACHE="$(command -v ccache)"
+            ccache --version | head -1
+            ccache --zero-stats
+          fi
+          if [ "$KEEP_GOING" = true ]; then export MAKEFLAGS="-k"; else export MAKEFLAGS=""; fi
+          # Measurement only (no effect on the build): every output line gets "[seconds since
+          # start]", and `top` samples the busiest processes every 2 s into cpu-sample.txt.
+          # Both are copied into the out artifact under perf/.
+          STAMP='BEGIN{$|=1;$t=time} printf "[%5d] %s", time-$t, $_'
+          top -l 0 -s 2 -n 8 -o cpu -stats pid,cpu,command | perl -ne "$STAMP" > "$HOME/cpu-sample.txt" &
+          SAMPLER=$!
+          : > "$HOME/build-timed.log"
+          tail -n +1 -F "$HOME/build-timed.log" 2>/dev/null | grep --line-buffered -E "⇒|Done" &
+          TAILER=$!
+          set +e
+          bash build.sh 2>&1 | perl -ne "$STAMP" > "$HOME/build-timed.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          sleep 2
+          kill "$TAILER" 2>/dev/null || true
+          pkill -f "tail -n +1 -F" 2>/dev/null || true
+          kill "$SAMPLER" 2>/dev/null || true
+          pkill -f "top -l 0" 2>/dev/null || true
+          echo "$status" > "$HOME/build.status"
+          echo "build.sh exit status: $status"
+          echo "--- phases (seconds since start) ---"
+          grep -E "⇒|Done|Kernel version banner" "$HOME/build-timed.log" | grep -vE "Applying patch|Running script" | cut -c1-120 || true
+
+      - name: ccache statistics
+        ignore_failure: true
+        script: |
+          set -euo pipefail
+          if [ "$USE_CCACHE" = true ]; then
+            ccache --show-stats
+          else
+            echo "ccache disabled"
+          fi
+
+      - name: Package build tree for local compiles
+        ignore_failure: true
+        script: |
+          set -euo pipefail
+          # Generated headers, config option headers, mig output and the patched
+          # source: enough to re-run any single compile command from the log locally.
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          mkdir -p sdk-kernel-platform
+          cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
+          tar czf buildtree.tgz \
+            --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
+            --exclude='kernel.development.*' --exclude='.git' \
+            -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
+            -C .. sdk-kernel-platform
+          ls -la buildtree.tgz
+
+      - name: Inspect closed KDK support libs
+        ignore_failure: true
+        script: |
+          set -euo pipefail
+          mkdir -p out/kdk-libs
+          shopt -s nullglob
+          for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+            b=$(basename "$lib" .a)
+            ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
+            nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
+            lipo -info "$lib" >> out/kdk-libs/arch.txt 2>&1 || true
+          done
+          ls -la out/kdk-libs
+
+      - name: Collect
+        ignore_failure: true
+        script: |
+          set -euo pipefail
+          mkdir -p out out/perf
+          cp "$HOME/build-timed.log" "$HOME/cpu-sample.txt" out/perf/ 2>/dev/null || true
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          ls -la out
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+
+      - name: Fail the job if the build failed
+        script: |
+          set -euo pipefail
+          status=$(cat "$HOME/build.status" 2>/dev/null || echo 1)
+          echo "build status: $status"
+          exit "$status"
+
+    artifacts:
+      - buildtree.tgz
+      - out/**

@@ -12,7 +12,11 @@ Local workspace: `/home/dipa/ios-extra`. The existing `/home/dipa/ios-sweet` che
 
 ## Builds
 
-The repository is public, so kernel patch pushes to `main` can build automatically. A manual build can also be started:
+CircleCI workflow `build-kernel` (`.circleci/config.yml`, `m4pro.medium`, Xcode 15.4.0) runs when someone uses **Trigger Pipeline** in the CircleCI UI or the pipeline API. Both set `pipeline.trigger_source` to `api` and take the parameters in that file. The comment there shows the `main`-branch `when` arm to put back if automatic pushes should start the job again. Until that file is on `main`, a push to `main` still loads the previous config and can start the macOS job.
+
+Codemagic workflow id `xnu-kernel` (`codemagic.yaml`) is manual as well: the file has no `triggering` section. It pins `instance_type: mac_mini_m2` and `xcode: "16.0"` (Codemagic's macOS 14.7 image, Xcode 16.0 at `/Applications/Xcode-16.0.app`). In the app, use **Start new build**, choose the branch and workflow `xnu-kernel`, and leave the inputs at their defaults unless a different kernel config is intended. The cap is 60 minutes. Artifacts are `buildtree.tgz` and `out/**` (kernels, `SHA256SUMS`, `perf/`). The workflow does not sign or publish.
+
+GitHub Actions (`.github/workflows/xnu.yml`) still starts on a push to `main` that changes `xnu/patches/**` or that workflow, and it can be started by hand:
 
 ```sh
 gh workflow run xnu.yml -R dipa-studio/ios-extra
