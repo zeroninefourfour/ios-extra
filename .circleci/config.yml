@@ -1,8 +1,16 @@
 version: 2.1
 
 # Port of .github/workflows/xnu.yml. Keep the two in step.
-# Trigger it by hand with pipeline parameters (CircleCI UI "Trigger Pipeline", or API with
-# "parameters": {...}); pushes to main run it with the defaults.
+# This config does not start the job on a push. It runs only when
+# pipeline.trigger_source is "api" (CircleCI UI "Trigger Pipeline", or the API),
+# using the parameters above. Defaults match the old main-branch build; pass
+# "parameters": {...} to override. A push to main keeps using whatever config
+# is already on main until this file is merged there.
+# To turn automatic pushes to main back on, restore this when-clause:
+#   when:
+#     or:
+#       - equal: [main, << pipeline.git.branch >>]
+#       - equal: [api, << pipeline.trigger_source >>]
 
 parameters:
   macos_version:
@@ -208,11 +216,11 @@ jobs:
 
 workflows:
   build-kernel:
-    # GitHub: `push: branches: [main]` + workflow_dispatch. Here: main, or any API/UI-triggered
-    # pipeline (so a manual run on another branch is not filtered out).
+    # GitHub Actions still has `push: branches: [main]` plus workflow_dispatch.
+    # This workflow used to run on that same main push (equal: [main, pipeline.git.branch])
+    # or on any API/UI trigger. The main-branch arm is removed, so a webhook push
+    # does not start the m4pro.medium job. Trigger Pipeline / the API still do.
     when:
-      or:
-        - equal: [main, << pipeline.git.branch >>]
-        - equal: [api, << pipeline.trigger_source >>]
+      equal: [api, << pipeline.trigger_source >>]
     jobs:
       - build

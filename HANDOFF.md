@@ -24,7 +24,12 @@ then the next question.** The user prefers slow and careful over fast and clever
   with the user in one line; they have been approving by putting the phone in fastboot.
 - Keep device serials, dumps, Apple files and downloaded firmware out of Git.
 - Do not add Claude/Codex attribution to commits or docs. Commit messages describe
-  the change only. Commit completed changes; push to `main` triggers the CI build.
+  the change only. Commit completed changes. A push to `main` still starts GitHub
+  Actions `xnu` when `xnu/patches/**` or `.github/workflows/xnu.yml` changes.
+  CircleCI `build-kernel` runs from **Trigger Pipeline** or the API, and Codemagic
+  `xnu-kernel` from **Start new build**, once those config files are on `main`
+  (see README Builds). Until the CircleCI change is merged, a push to `main`
+  still starts the paid `m4pro.medium` job.
 - Say what you measured vs. what you only read. Do not estimate completion dates
   beyond "N more measured steps".
 - Do not write product roadmaps or future-feature lists into NOTES/README.
@@ -157,8 +162,10 @@ announce lines are the evidence. Make the next build smaller, not bigger.
    every precondition must have a test proving *nothing is written* when it fails.
    Run normally and with `IOS_EXTRA_CFLAGS="-fsanitize=address,undefined
    -fno-sanitize-recover=all -g"`.
-5. Update `docs/GPU_CX_EXPERIMENT.md` (design), commit, `git push`. CI starts
-   automatically on pushes touching `xnu/patches/**`. Watch with
+5. Update `docs/GPU_CX_EXPERIMENT.md` (design), commit, `git push`. GitHub Actions
+   `xnu` still starts on pushes to `main` that touch `xnu/patches/**`. CircleCI
+   `build-kernel` is a **Trigger Pipeline** / API run; Codemagic `xnu-kernel` is
+   **Start new build** (see README Builds). Watch GitHub with
    `gh run watch RUN -R dipa-studio/ios-extra`; a green run takes ~6 min.
 6. Download: `gh run download RUN -R dipa-studio/ios-extra -n xnu-kernel -D
    $W/out-00NN` (check `SHA256SUMS`) and `-n xnu-buildtree -D $W/ci-00NN`; extract

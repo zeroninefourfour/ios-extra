@@ -1,6 +1,6 @@
 # ios-extra — current state
 
-Last updated 2026-10-19 after the 0097 phone test and 0098 local checks. Read [HANDOFF.md](HANDOFF.md) for how to
+CI section added 2026-11-09. The GPU write-up below is the earlier record. Read [HANDOFF.md](HANDOFF.md) for how to
 continue and [AGENTS.md](AGENTS.md) for the rules. The per-step history (images,
 hashes, CI runs, raw numbers) is [docs/GPU_LOG.md](docs/GPU_LOG.md); the hardware and
 mainline reference is [docs/GPU_GMU_BOOT.md](docs/GPU_GMU_BOOT.md); the per-patch
@@ -12,9 +12,31 @@ Driver playground for the XNU/iOS 16 port to the Redmi Note 10 Pro (`sweet`,
 SM7150, Adreno 618). The target is a real Adreno driver; the display today is
 CPU-rendered. Public repo `dipa-studio/ios-extra`, branch `main`. The user made it
 private overnight, then authorized restoring public visibility on 2026-10-19;
-GitHub now confirms public. Kernel builds use this repo's GitHub Actions
-(`.github/workflows/xnu.yml`, macOS runner, ~6 min).
+GitHub now confirms public. Kernel build entry points are GitHub Actions
+(`.github/workflows/xnu.yml`), CircleCI (`.circleci/config.yml`), and Codemagic
+(`codemagic.yaml`, workflow `xnu-kernel`). See the CI section below.
 `/home/dipa/ios-sweet` belongs to other agents: read-only for us.
+
+## CI (2026-11-09)
+
+Observed from this checkout: CircleCI GitHub OAuth project
+`github/zeroninefourfour/ios-extra` runs workflow `build-kernel` on pushes to
+`main` (`why: github`, status context `ci/circleci: build`). Build 35 succeeded
+in 244913 ms. The workflow `when` in `.circleci/config.yml` is now only
+`pipeline.trigger_source == api` (UI **Trigger Pipeline** or the API). A push
+to `main` keeps starting the `m4pro.medium` job until that config is merged.
+The commits that introduce the change include `[skip ci]`. On this GitHub OAuth
+project that skips the push, and it also skips a later manual trigger of a
+commit whose message still contains the marker.
+
+`codemagic.yaml` workflow id `xnu-kernel` has no `triggering` section.
+`instance_type: mac_mini_m2` and `xcode: "16.0"` are the documented macOS 14.7
+(23H124) / Xcode 16.0 (16A242d) / M2 image (`/Applications/Xcode-16.0.app`).
+`max_build_duration` is 60. No publishing, signing, or credentials. The file
+was checked against the Codemagic JSON schema. Running it needs the Codemagic
+Mac builder; this environment did not start a Codemagic build.
+
+GitHub Actions workflow `xnu` is unchanged.
 
 ## Where the GPU bring-up stands (all measured on the phone unless noted)
 
