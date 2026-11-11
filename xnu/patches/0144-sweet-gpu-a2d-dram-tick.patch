@@ -33,12 +33,21 @@
      const uint64_t scratch=NativeAdrenoGpuScratchIova();
 --- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
-@@ -334,6 +334,10 @@
+@@ -4,6 +4,9 @@
+ #include <IOKit/IOLib.h>
+ 
+ extern "C" void sweet_log_sync(void) __attribute__((weak));
++/* #region agent log */
++extern "C" void native_adreno_a2d_dram_tick(uint32_t fence);
++/* #endregion */
+ /* Write-ahead marker: the persistent log must hold the line before the access that may stall the SoC. */
+ static void ring_mark(const char *what)
+ {
+@@ -334,6 +337,9 @@
                  for(unsigned i=0;i<9;++i){uint32_t v=0;if(!io_.read32(io_.cookie,xregs[i],&v))x[i]=v;}
                  IOLog("NativeAdrenoRing: late fence #%u extra: status2 %08x status3 %08x (smmu-stalled %u) ib1 init %08x ib2 %08x%08x rem %08x protect %08x roq-ib1 %08x roq-ib2 %08x\n",
                      late,x[0],x[1],(x[1]>>24)&1,x[2],x[4],x[3],x[5],x[6],x[7],x[8]);
 +                /* #region agent log */
-+                extern "C" void native_adreno_a2d_dram_tick(uint32_t);
 +                native_adreno_a2d_dram_tick(fence);
 +                /* #endregion */
              }
