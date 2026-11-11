@@ -24,6 +24,27 @@
      if(fence!=4 || !ring || !clock)return;
      static bool done;
      if(done)return;
+@@ -39,6 +54,10 @@
+         ring->readReg(0x8406,&destBr) & ring->readReg(0x8e04,&eco) & ring->readReg(0x8e05,&addrMode) & ring->readReg(0x8e08,&ncMode);
+     IOLog("NativeAdrenoSubmit: A2D mode %s dstinfo %08x spout %08x tl %08x br %08x eco %08x addr %08x nc %08x\n",
+         mode?"ok":"READ FAILED",dstInfo,spOut,destTl,destBr,eco,addrMode,ncMode);
++    /* #region agent log */
++    if(vm && vm->prefillPhysical(&a2d_dest_pa)) {a2d_have_pa=true;logA2dDram("now",fence);}
++    else IOLog("NativeAdrenoSubmit: A2D dram now fence %u pa unavailable\n",fence);
++    /* #endregion */
+     const uint64_t scratch=NativeAdrenoGpuScratchIova();
+     volatile uint32_t *words=NativeAdrenoGpuScratchWords();
+     if(!scratch || !words) {
+@@ -425,6 +444,9 @@
+             }
+         }
+         ++stats_.timeouts;
++        /* #region agent log */
++        if(a2d_have_pa && !a2d_timeout_done) {a2d_timeout_done=true;logA2dDram("timeout",fence);}
++        /* #endregion */
+         native_adreno_fence_wait[1]=native_adreno_fence_wait[1]+1;native_adreno_fence_wait[2]=fence;native_adreno_fence_wait[3]=observed;
+         native_adreno_fence_wait[4]=ring_->lastSubmitted();native_adreno_fence_wait[5]=ring_->completedFence();
+         return kIOReturnTimeout;
 --- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
 +++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
 @@ -103,6 +103,8 @@
