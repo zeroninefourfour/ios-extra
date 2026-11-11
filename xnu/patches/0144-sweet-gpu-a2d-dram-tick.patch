@@ -1,0 +1,46 @@
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -24,7 +24,7 @@
+ }
+ /* After fence 4, copy the prefill BO (control) and every 4 KiB of the 512 KiB GMEM window into scratch. */
+ /* #region agent log */
+-static uint64_t a2d_dest_pa;
++static uint64_t a2d_dest_pa,a2d_dest_iova;
+ static bool a2d_have_pa,a2d_late_done,a2d_timeout_done;
+ static void logA2dDram(const char *when,uint32_t fence)
+ {
+@@ -34,6 +34,12 @@
+     IOLog("NativeAdrenoSubmit: A2D dram %s fence %u %s pa 0x%llx %08x %08x %08x %08x\n",
+         when,fence,ok?"ok":"READ FAILED",(unsigned long long)a2d_dest_pa,w0,w1,w2,w3);
+ }
++extern "C" void native_adreno_a2d_dram_tick(uint32_t fence)
++{
++    if(!a2d_have_pa)return;
++    logA2dDram("tick",fence);
++    IOLog("NativeAdrenoSubmit: A2D dram iova fence %u 0x%llx\n",fence,(unsigned long long)a2d_dest_iova);
++}
+ /* #endregion */
+ static void probeGmemColor(NativeAdrenoRing *ring,NativeAdrenoVm *vm,const NativeAdrenoRingClock *clock,uint32_t fence)
+ {
+@@ -55,7 +61,7 @@
+     IOLog("NativeAdrenoSubmit: A2D mode %s dstinfo %08x spout %08x tl %08x br %08x eco %08x addr %08x nc %08x\n",
+         mode?"ok":"READ FAILED",dstInfo,spOut,destTl,destBr,eco,addrMode,ncMode);
+     /* #region agent log */
+-    if(vm && vm->prefillPhysical(&a2d_dest_pa)) {a2d_have_pa=true;logA2dDram("now",fence);}
++    if(vm && vm->prefillPhysical(&a2d_dest_pa)) {a2d_have_pa=true;a2d_dest_iova=vm->prefillIova();logA2dDram("now",fence);}
+     else IOLog("NativeAdrenoSubmit: A2D dram now fence %u pa unavailable\n",fence);
+     /* #endregion */
+     const uint64_t scratch=NativeAdrenoGpuScratchIova();
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+@@ -334,6 +334,10 @@
+                 for(unsigned i=0;i<9;++i){uint32_t v=0;if(!io_.read32(io_.cookie,xregs[i],&v))x[i]=v;}
+                 IOLog("NativeAdrenoRing: late fence #%u extra: status2 %08x status3 %08x (smmu-stalled %u) ib1 init %08x ib2 %08x%08x rem %08x protect %08x roq-ib1 %08x roq-ib2 %08x\n",
+                     late,x[0],x[1],(x[1]>>24)&1,x[2],x[4],x[3],x[5],x[6],x[7],x[8]);
++                /* #region agent log */
++                extern "C" void native_adreno_a2d_dram_tick(uint32_t);
++                native_adreno_a2d_dram_tick(fence);
++                /* #endregion */
+             }
+             return NativeAdrenoRingFenceTimeout;
+         }
