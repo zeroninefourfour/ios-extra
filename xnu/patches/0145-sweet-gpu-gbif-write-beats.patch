@@ -1,0 +1,43 @@
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoService.cpp
+@@ -608,6 +608,12 @@
+     gpu_write32(&gpu_window, 0x8e11, 29);
+     gpu_write32(&gpu_window, 0x8e18, 28);
+     gpu_write32(&gpu_window, 0x8e19, 5);
++    /* GBIF data counters share one select register, one byte per counter (kgsl). Counter 0 counts AXI0 write-data
++     * beats (46), counter 1 counts AXI1 write-data beats (47). Clear, select, then enable, before CP protect. */
++    gpu_write32(&gpu_window, 0x3cc1, 0x3);
++    gpu_write32(&gpu_window, 0x3cc1, 0);
++    gpu_write32(&gpu_window, 0x3cc2, 46u | (47u << 8));
++    gpu_write32(&gpu_window, 0x3cc0, 0x3);
+     gpu_write32(&gpu_window, A618_RBBM_INTERFACE_HANG_INT_CNTL, (1u << 30) | 0x1fffff);
+     /* No CP_APRIV_CNTL: A618 lacks ADRENO_QUIRK_HAS_HW_APRIV in mainline a6xx_catalog.c, so a6xx_hw_init never writes it.
+      * The old value 0x6e (CDWRITE|CDREAD|RBRPWB|RBPRIVLEVEL|RBFETCH) is the A650-family one; it made the CP's memory writes
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -63,6 +63,11 @@
+     /* #region agent log */
+     if(vm && vm->prefillPhysical(&a2d_dest_pa)) {a2d_have_pa=true;a2d_dest_iova=vm->prefillIova();logA2dDram("now",fence);}
+     else IOLog("NativeAdrenoSubmit: A2D dram now fence %u pa unavailable\n",fence);
++    uint32_t gbifEn=0,gbifSel=0,axi0Lo=0,axi0Hi=0,axi1Lo=0,axi1Hi=0;
++    const bool gbif=ring->readReg(0x3cc0,&gbifEn) & ring->readReg(0x3cc2,&gbifSel) & ring->readReg(0x3cc4,&axi0Lo) &
++        ring->readReg(0x3cc8,&axi0Hi) & ring->readReg(0x3cc5,&axi1Lo) & ring->readReg(0x3cc9,&axi1Hi);
++    IOLog("NativeAdrenoSubmit: GBIF write beats now %s en %08x sel %08x axi0 %08x:%08x axi1 %08x:%08x\n",
++        gbif?"ok":"READ FAILED",gbifEn,gbifSel,axi0Hi,axi0Lo,axi1Hi,axi1Lo);
+     /* #endregion */
+     const uint64_t scratch=NativeAdrenoGpuScratchIova();
+     volatile uint32_t *words=NativeAdrenoGpuScratchWords();
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoRing.cpp
+@@ -339,6 +339,11 @@
+                     late,x[0],x[1],(x[1]>>24)&1,x[2],x[4],x[3],x[5],x[6],x[7],x[8]);
+                 /* #region agent log */
+                 native_adreno_a2d_dram_tick(fence);
++                uint32_t g[6];for(unsigned i=0;i<6;++i)g[i]=0xffffffffu;
++                static const uint32_t gregs[6]={0x3cc0,0x3cc2,0x3cc4,0x3cc8,0x3cc5,0x3cc9};
++                for(unsigned i=0;i<6;++i){uint32_t v=0;if(!io_.read32(io_.cookie,gregs[i],&v))g[i]=v;}
++                IOLog("NativeAdrenoRing: GBIF write beats tick en %08x sel %08x axi0 %08x:%08x axi1 %08x:%08x\n",
++                    g[0],g[1],g[3],g[2],g[5],g[4]);
+                 /* #endregion */
+             }
+             return NativeAdrenoRingFenceTimeout;
