@@ -1,0 +1,14 @@
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -34,6 +34,11 @@
+         ring->readReg(0x8c18,&baseLo) & ring->readReg(0x8c19,&baseHi) & ring->readReg(0x8c1a,&pitch) & ring->readReg(0x8c2c,&clear);
+     IOLog("NativeAdrenoSubmit: A2D live %s protect %08x ccu %08x blt %08x base %08x:%08x pitch %08x clear %08x\n",
+         live?"ok":"READ FAILED",protect,ccu,blt,baseHi,baseLo,pitch,clear);
++    uint32_t dstInfo=0,spOut=0,destTl=0,destBr=0,eco=0,addrMode=0,ncMode=0;
++    const bool mode=ring->readReg(0x8c17,&dstInfo) & ring->readReg(0xacc0,&spOut) & ring->readReg(0x8405,&destTl) &
++        ring->readReg(0x8406,&destBr) & ring->readReg(0x8e04,&eco) & ring->readReg(0x8e05,&addrMode) & ring->readReg(0x8e08,&ncMode);
++    IOLog("NativeAdrenoSubmit: A2D mode %s dstinfo %08x spout %08x tl %08x br %08x eco %08x addr %08x nc %08x\n",
++        mode?"ok":"READ FAILED",dstInfo,spOut,destTl,destBr,eco,addrMode,ncMode);
+     const uint64_t scratch=NativeAdrenoGpuScratchIova();
+     volatile uint32_t *words=NativeAdrenoGpuScratchWords();
+     if(!scratch || !words) {
