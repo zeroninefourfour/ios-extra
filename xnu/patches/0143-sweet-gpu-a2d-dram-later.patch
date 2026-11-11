@@ -1,0 +1,58 @@
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoSubmit.cpp
+@@ -23,8 +23,23 @@
+     return waited;
+ }
+ /* After fence 4, copy the prefill BO (control) and every 4 KiB of the 512 KiB GMEM window into scratch. */
++/* #region agent log */
++static uint64_t a2d_dest_pa;
++static bool a2d_have_pa,a2d_late_done,a2d_timeout_done;
++static void logA2dDram(const char *when,uint32_t fence)
++{
++    uint32_t w0=0,w1=0,w2=0,w3=0;
++    const bool ok=a2d_have_pa && NativeAdrenoReadPhysicalWord(a2d_dest_pa,&w0) && NativeAdrenoReadPhysicalWord(a2d_dest_pa+4,&w1) &&
++        NativeAdrenoReadPhysicalWord(a2d_dest_pa+8,&w2) && NativeAdrenoReadPhysicalWord(a2d_dest_pa+12,&w3);
++    IOLog("NativeAdrenoSubmit: A2D dram %s fence %u %s pa 0x%llx %08x %08x %08x %08x\n",
++        when,fence,ok?"ok":"READ FAILED",(unsigned long long)a2d_dest_pa,w0,w1,w2,w3);
++}
++/* #endregion */
+ static void probeGmemColor(NativeAdrenoRing *ring,NativeAdrenoVm *vm,const NativeAdrenoRingClock *clock,uint32_t fence)
+ {
++    /* #region agent log */
++    if(fence==8 && a2d_have_pa && !a2d_late_done) {a2d_late_done=true;logA2dDram("later",fence);}
++    /* #endregion */
+     if(fence!=4 || !ring || !clock)return;
+     static bool done;
+     if(done)return;
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.h
+@@ -103,6 +103,8 @@
+     NativeAdrenoMemory *firstLargeWritableImport(uint64_t *iova) const;
+     /* GPU address of a writable BO whose first DRAM word is still the 0xA5A5A5A5 prefill. */
+     uint64_t prefillIova() const;
++    /* Physical address of that same first word, captured while the prefill is still intact. */
++    bool prefillPhysical(uint64_t *physical) const;
+     /* Diagnostic, never a proof of coherence: the 32-bit word at a mapped GPU address as the kernel's cacheable alias reads it
+      * and, when the board installed native_adreno_dram_read32, as DRAM reads it through an uncached mapping (else ~0). */
+     IOReturn sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dram) const;
+--- a/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
++++ b/iokit/Kernel/arm/adreno/NativeAdrenoVm.cpp
+@@ -481,6 +481,18 @@
+     }
+     return 0;
+ }
++bool NativeAdrenoVm::prefillPhysical(uint64_t *physical) const
++{
++    if(!physical || !attached_ || poisoned_)return false;
++    for(size_t i=0;i<NativeAdrenoVmMaxObjects;++i) {
++        const Mapping &m=mappings_[i];
++        if(!m.memory || !(m.permissions&ArmSmmu4KWrite) || m.memory->bytes()<(1u<<20) || !m.memory->spanCount())continue;
++        uint32_t v=0;
++        const uint64_t pa=m.memory->spans()[0].physical;
++        if(NativeAdrenoReadPhysicalWord(pa,&v) && v==0xa5a5a5a5u) {*physical=pa;return true;}
++    }
++    return false;
++}
+ void NativeAdrenoVm::probeIova(uint64_t iova,uint32_t rem,uint32_t initSize,uint32_t roqRem,bool dumpAll) const
+ {
+     if(!attached_)return;
